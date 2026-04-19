@@ -19,11 +19,11 @@
 #include <sys/time.h>
 #include <math.h>
 
-#define DIM       128
-#define NLAYERS   4
-#define NHEADS    4
+#define DIM       160
+#define NLAYERS   6
+#define NHEADS    5
 #define HEAD_DIM  32
-#define HIDDEN    256
+#define HIDDEN    320
 #define CTX       128
 #define VOCAB     2048
 

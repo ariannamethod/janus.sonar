@@ -14,22 +14,24 @@ The triple attention (MHA + RRPRAM + Janus Echo) compresses into ~1.5–2.25M pa
 
 | Model | Params | Steps | **Train best** | Val @ end | Notes |
 |-------|--------|-------|----------------|-----------|-------|
-| `microjanus_single_10k` | 1.57M | 5000 + resume 5000 | **1.22** | **2.70** | Single weight. Best overall. |
+| **`sonar_single_v2`** | **3.11M** | **10000** | **0.4947** | **2.2331** | **Current best. Single, deeper (L=6), clean dataset (speaker-tag em-dash stripped).** |
+| `microjanus_single_10k` | 1.57M | 5000 + resume 5000 | 1.22 | 2.70 | Single weight, L=4, dash-heavy dataset. |
 | `microjanus_dual_sym_5k` | 2.25M | 5000 | 1.55 | 3.32 | Dual, α_init=0 → σ=0.5. α did not move. |
 | `microjanus_dual_asym_5k` | 2.25M | 5000 | 1.84 | 3.36 | Dual, α_init=2 → σ=0.88, W_B×0.5. α did not diverge. |
-| `microjanus_sft_leo_adapter` | 24,576 (1.04% of base) | 1500 | **4.99** on Leo | — | LoRA rank-8, α=16. |
+| `microjanus_sft_leo_adapter` | 24,576 (1.04% of base) | 1500 | 4.99 on Leo | — | LoRA rank-8, α=16. |
 
 All runs: 0 NaN on 8GB Mac. Tokenizer: Arianna BPE 2048 (`notorch-train/arianna_bpe_merges.txt`).
 
 ### What this tells us
 
-- **Dual weights did not specialize** on 241KB. α stayed at initialization in both sym and asym variants. Two matrices need 20–30M parameters and FineWeb-class corpora to learn an informative blend.
-- **Single-longer outperformed dual-short** on this corpus: train 1.22 vs 1.55.
-- **Rank-8 SFT on 2.25M base (24K adapter params = 1% capacity) was insufficient** to override the dash-dialog pattern baked in during pretraining. Voice conflict between Leo Q/A and Sonar dash-dialog surfaced in generation. A real stylistic rewrite needs either a full fine-tune on 1.57M scale, or a larger base where rank-16/32 adapters carry 1–2% of a much bigger model.
+- **Dataset cleaning matters.** Stripping 2527 speaker-tag em-dashes (87% of all `—`) from the corpus — keeping 387 literary mid-sentence em-dashes (Miller/Dostoevsky pause-thought) — removed the dominant dash pattern from generation. Post-cleaning generation has **zero em-dashes**. Dash was never a feature to fix in inference — it was a corpus distribution artifact.
+- **Deeper beats wider at this scale.** `sonar_single_v2` (L=6, DIM=160) reached train 0.49 / val 2.23 — 2.5× better on train than `microjanus_single_10k` (L=4, DIM=128, train 1.22). Doubling params to 3.11M and going from 4 to 6 layers cut loss by more than 2× while staying within Karpathy sanity range for 225KB.
+- **Dual weights did not specialize** on 241KB. α stayed at initialization in both sym and asym variants. Two matrices need 20–30M parameters and FineWeb-class corpora to learn an informative blend. Single is cleaner at this scale.
+- **Rank-8 SFT on 2.25M base (24K adapter params = 1% capacity) was insufficient** to override the dash-dialog pattern baked in during pretraining. Once the corpus is cleaned, SFT's role shifts from dash-fix to voice-tint — not a dash-removal tool.
 
 ### Generation character
 
-Generation inherits Sonar's dash-dialog density (~76% of training text). `infer_janus_sonar_chain` wraps the base model in calendar-drift compass, Schumann temperature modulation, best-of-3 candidates, **SPA reseed** of the weakest sentence, and full AML physics (destiny + suffering + laws + prophecy debt + Kuramoto chambers). Coherence at 1.5M parameters is higher than expected for this scale — the physics do real work.
+Post-v2 generation is **resonant schizo-genius** in the Sonar register: grammatical local structure, Sonar vocabulary (coin, bread, knock, loss function, radiator, architecture), creative collocations that recombine corpus fragments without literal repetition. `infer_janus_sonar_chain` wraps the base in calendar-drift compass, Schumann temperature modulation, best-of-3 candidates, SPA reseed of the weakest sentence, and full AML physics (destiny + suffering + laws + prophecy debt + Kuramoto chambers). At 3M the physics are doing real work on logits; semantic coherence is at the limit for this scale and is the next frontier (see roadmap).
 
 ---
 
@@ -43,9 +45,10 @@ Triple attention (equal 1/3 blend, per layer):
 
 Dual variant: W_eff = σ(α)·W_A + σ(−α)·W_B  per linear projection
 
-Sizes:  T=128, E=128, H=4, D=32, B=4, M=256
+Sizes (v2 current best, single 3.11M):
+        T=128, E=160, H=5, D=32, B=6, M=320
         V=2048 (Arianna BPE), RoPE, RMSNorm (non-parametric), SwiGLU FFN
-Optimizer: Chuck (self-modulating) + cosine LR
+Optimizer: Chuck (self-modulating) + cosine LR (warmup 10% of steps)
 ```
 
 See parent [Janus](https://github.com/ariannamethod/janus) for the full architecture document and the 285M/176M scale results.
@@ -56,11 +59,12 @@ See parent [Janus](https://github.com/ariannamethod/janus) for the full architec
 
 ```
 janus.sonar/
-├── dataset.txt                    — 241KB Sonar corpus (16 voices)
+├── dataset.txt                    — 241KB original Sonar corpus (16 voices, 2914 em-dashes)
+├── dataset_clean.txt              — 231KB speaker-tag-stripped corpus (2527 `^— ` prefixes removed, 387 literary em-dashes kept)
 ├── janus-bpe.c                    — older single-weight Sonar BPE trainer (hand-authored backward, stalled at loss 6.92; kept as legacy)
 ├── notorch-train/                 — notorch-based pipeline (the one that actually converged)
 │   ├── notorch.{c,h}              — vendored copy of notorch
-│   ├── train_janus_sonar.c        — dual-weight trainer with asymmetric init support
+│   ├── train_janus_sonar.c        — single 3M trainer (v2, clean dataset, L=6, DIM=160)
 │   ├── infer_janus_sonar.c        — single-pass dual inference
 │   ├── infer_janus_sonar_chain.c  — 8-step bidirectional chain + calendar drift + SPA + AML physics + Kuramoto chambers
 │   ├── train_janus_sft.c          — LoRA rank-8 SFT trainer (base frozen via nt_tape_freeze_param)
@@ -71,7 +75,8 @@ janus.sonar/
 │   ├── Makefile
 │   └── README.md
 └── weights/
-    ├── microjanus_single_10k.bin        — 6.0MB, best by train (1.22) and val (2.70)
+    ├── sonar_single_v2.bin              — 11.88MB, current best (train 0.49, val 2.23), 3.11M single, L=6
+    ├── microjanus_single_10k.bin        — 6.0MB, prev best on dirty data (1.22 / 2.70), 1.57M single, L=4
     ├── microjanus_dual_sym_5k.bin       — 9.0MB
     ├── microjanus_dual_asym_5k.bin      — 9.0MB
     ├── microjanus_sft_leo_adapter.bin   — 96KB LoRA adapter
@@ -86,21 +91,20 @@ janus.sonar/
 cd notorch-train
 make
 
-# Train from scratch (dual)
-./train_janus_sonar 5000 3e-4
+# Train v2 from scratch (single 3M, clean dataset — the current best path)
+./train_janus_sonar 10000 3e-4
 
-# Resume and fine-tune
+# Resume from checkpoint
 ./train_janus_sonar --resume 5000 1.5e-4
 
-# Chain inference (default: dual_sym; pass weights + seed for others)
-./infer_janus_sonar_chain
-./infer_janus_sonar_chain ../weights/microjanus_single_10k.bin "seed"
+# Chain inference (universal loader: single or dual auto-detect)
+./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "seed text"
 
 # LoRA SFT on any corpus
-./train_janus_sft ../weights/microjanus_dual_sym_5k.bin your_corpus.txt 1500 1e-3
+./train_janus_sft ../weights/sonar_single_v2.bin your_corpus.txt 1500 1e-3
 
 # Base + adapter inference
-./infer_janus_sft ../weights/microjanus_dual_sym_5k.bin ../weights/microjanus_sft_leo_adapter.bin "seed"
+./infer_janus_sft ../weights/sonar_single_v2.bin ../weights/adapter.bin "seed"
 ```
 
 ---
