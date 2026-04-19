@@ -520,7 +520,7 @@ int main(int argc, char** argv) {
     /* Encode seed */
     int cids[4096];
     int clen = nt_bpe_encode(&bpe, seed_text, (int)strlen(seed_text), cids, 4096);
-    printf("seed: %d tokens\n", clen);
+    printf("seed: \"%s\" (%d tokens)\n", seed_text, clen);
 
     /* Calendar drift compass */
     float cd = calendar_drift();
@@ -609,8 +609,10 @@ int main(int argc, char** argv) {
         chain_lens[si] = best_ol;
         memcpy(chain_ids[si], best_out, best_ol * sizeof(int));
 
-        printf("  [%d] %c T=%.2f sc=%.2f debt=%.2f ", si+1, chain_marks[si], temp, best_sc, field.prophecy_debt);
-        print_sentence(&bpe, best_out, best_ol);
+        printf("  [%d] %c T=%.2f sc=%.2f debt=%.2f [", si+1, chain_marks[si], temp, best_sc, field.prophecy_debt);
+        print_sentence(&bpe, best_out, plen);
+        printf("]→");
+        print_sentence(&bpe, best_out + plen, best_ol - plen);
         printf("\n");
         fflush(stdout);
 

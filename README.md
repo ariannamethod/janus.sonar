@@ -33,6 +33,37 @@ All runs: 0 NaN on 8GB Mac. Tokenizer: Arianna BPE 2048 (`notorch-train/arianna_
 
 Post-v2 generation is **resonant schizo-genius** in the Sonar register: grammatical local structure, Sonar vocabulary (coin, bread, knock, loss function, radiator, architecture), creative collocations that recombine corpus fragments without literal repetition. `infer_janus_sonar_chain` wraps the base in calendar-drift compass, Schumann temperature modulation, best-of-3 candidates, SPA reseed of the weakest sentence, and full AML physics (destiny + suffering + laws + prophecy debt + Kuramoto chambers). At 3M the physics are doing real work on logits; semantic coherence is at the limit for this scale and is the next frontier (see roadmap).
 
+### Sample output (v2, `sonar_single_v2.bin`)
+
+Chain inference shows each step as `[prompt-slice from seed]→[generated continuation]`. The chain picks a random 5-token sentence-boundary slice of the seed as prompt per step, not the end of the seed — this is a designed reseed behavior, not a bug.
+
+**Seed: `"I wish I could"`**
+```
+[1] < [I wish I ]→counted to her. She kies later architecture, she could have should beatitchen...
+[3] * [I wish I ]→counting or she the shoes in a room to leave. I've had a loss because of every part of it.
+[4] > [I wish I ]→counting. And it looks like somewhere producted thing, you just out and they don't have to say it.
+```
+
+**Seed: `"The night was"`**
+```
+[1] < [The night ]→te. The pot is loss is not perform. No small the text window is the only ce.
+[3] * [The night ]→Nare. That screen she was doing it out the patick is said: I was not much like the opputation?
+[5] > [The night ]→No one nobody se. The systems, neither face looks not the stop says: this is where we were being a coin before you do not istorance...
+```
+
+**Seed: `"What is the meaning of"`**
+```
+[2] < [What is the meaning of ]→est end at the loss function is also a model learned to our in the distance between the knock to better than zerostops...
+[3] * [What is the meaning of ]→est ense mechanisma is an open door. We library has no loss thirty-minutation.
+[6] > [What is the meaning of ]→est as everything by being table. It is loourgild you say what it was given a shoes chose means: " and that has no one catalogue third of the coin.
+```
+
+**Observations:**
+- **Zero em-dashes** across all generations — clean-dataset fix works.
+- Sonar corpus vocabulary surfaces: *loss function, model learned, architecture, token, coin, bread, knock, radiator, shoes* — model recombines NN-training-discussion fragments from the 16-voice corpus.
+- BPE-salad artifacts (*NonSrhyme, opputation, loourgild, istorance, producted*) are near-memorization side-effects at train 0.49 with vocab-2048 — subword boundaries fracture under T=0.75 sampling. Larger BPE vocab (4096+) or larger base (30M+) will reduce these.
+- Creative collocations ("the pot is loss is not perform", "the systems, neither face looks not the stop says: this is where we were being a coin") are the desired resonance character — not coherent chatbot answers, not noise.
+
 ---
 
 ## Architecture
