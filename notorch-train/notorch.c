@@ -497,6 +497,55 @@ void nt_tape_backward(int loss_idx) {
             break;
         }
 
+        case NT_OP_SEQ_ROW: {
+            /* y = x[row_idx*D : (row_idx+1)*D]; gx[row_idx*D + i] += dout[i] */
+            if (e->parent1 >= 0) {
+                nt_tape_entry* px = &g_tape.entries[e->parent1];
+                int row_idx = (int)e->aux;
+                int D = out_len;                    /* row size = output length */
+                int src_len = px->output->len;
+                if (row_idx >= 0 && (row_idx + 1) * D <= src_len) {
+                    float* gx = (float*)calloc(src_len, sizeof(float));
+                    if (gx) {
+                        memcpy(gx + row_idx * D, dout, D * sizeof(float));
+                        tape_acc_grad(e->parent1, gx, src_len);
+                    }
+                    free(gx);
+                }
+            }
+            break;
+        }
+
+        case NT_OP_TRIPLET_LOSS: {
+            /* loss = max(0, margin + dot(a,n) - dot(a,p))
+               Active (loss > 0): d/da = n - p,  d/dp = -a,  d/dn = a
+               Inactive:          all zeros.
+               dout[0] is the scalar grad from downstream (usually 1.0). */
+            if (e->output->data[0] > 0
+                && e->parent1 >= 0 && e->parent2 >= 0 && e->parent3 >= 0) {
+                nt_tape_entry* pa = &g_tape.entries[e->parent1];
+                nt_tape_entry* pp = &g_tape.entries[e->parent2];
+                nt_tape_entry* pn = &g_tape.entries[e->parent3];
+                int D = pa->output->len;
+                float go = dout[0];
+                float* ga = (float*)calloc(D, sizeof(float));
+                float* gp = (float*)calloc(D, sizeof(float));
+                float* gn = (float*)calloc(D, sizeof(float));
+                if (ga && gp && gn) {
+                    for (int i = 0; i < D; i++) {
+                        ga[i] = go * (pn->output->data[i] - pp->output->data[i]);
+                        gp[i] = -go * pa->output->data[i];
+                        gn[i] =  go * pa->output->data[i];
+                    }
+                    tape_acc_grad(e->parent1, ga, D);
+                    tape_acc_grad(e->parent2, gp, D);
+                    tape_acc_grad(e->parent3, gn, D);
+                }
+                free(ga); free(gp); free(gn);
+            }
+            break;
+        }
+
         case NT_OP_SOFTMAX: {
             if (e->parent1 >= 0) {
                 float dot_dy = 0;
@@ -2094,6 +2143,41 @@ int nt_scale_by_t(int x_idx, int a_idx) {
     float a_val = pa->output->data[0];
     for (int i = 0; i < n; i++) out->data[i] = a_val * px->output->data[i];
     int idx = nt_tape_record3(out, NT_OP_SCALE_BY_T, x_idx, a_idx, -1, 0, 0);
+    nt_tensor_free(out);
+    return idx;
+}
+
+int nt_seq_row(int x_idx, int row_idx, int D) {
+    if (x_idx < 0 || D <= 0 || row_idx < 0) return -1;
+    nt_tape_entry* px = &g_tape.entries[x_idx];
+    int src_len = px->output->len;
+    if ((row_idx + 1) * D > src_len) return -1;
+    nt_tensor* out = nt_tensor_new(D);
+    if (!out) return -1;
+    memcpy(out->data, px->output->data + row_idx * D, D * sizeof(float));
+    int idx = nt_tape_record(out, NT_OP_SEQ_ROW, x_idx, -1, (float)row_idx);
+    nt_tensor_free(out);
+    return idx;
+}
+
+int nt_triplet_loss(int anchor_idx, int pos_idx, int neg_idx, float margin) {
+    if (anchor_idx < 0 || pos_idx < 0 || neg_idx < 0) return -1;
+    nt_tape_entry* pa = &g_tape.entries[anchor_idx];
+    nt_tape_entry* pp = &g_tape.entries[pos_idx];
+    nt_tape_entry* pn = &g_tape.entries[neg_idx];
+    int D = pa->output->len;
+    if (pp->output->len != D || pn->output->len != D) return -1;
+    float sim_pos = 0, sim_neg = 0;
+    for (int i = 0; i < D; i++) {
+        sim_pos += pa->output->data[i] * pp->output->data[i];
+        sim_neg += pa->output->data[i] * pn->output->data[i];
+    }
+    float raw = margin + sim_neg - sim_pos;
+    float loss = raw > 0 ? raw : 0;
+    nt_tensor* out = nt_tensor_new(1);
+    if (!out) return -1;
+    out->data[0] = loss;
+    int idx = nt_tape_record3(out, NT_OP_TRIPLET_LOSS, anchor_idx, pos_idx, neg_idx, margin, 0);
     nt_tensor_free(out);
     return idx;
 }

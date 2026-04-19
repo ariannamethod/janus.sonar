@@ -108,6 +108,8 @@ void nt_tensor_print(const nt_tensor* t, const char* name);
 #define NT_OP_SEQ_MATVEC_T  26   // Y[t] = W^T @ X[t] — transposed seq_linear for Janus Echo
 #define NT_OP_SIGMOID       27   // y = 1 / (1 + exp(-x)) — logistic activation
 #define NT_OP_SCALE_BY_T    28   // y[i] = a[0] * x[i], a is scalar tensor [1]
+#define NT_OP_SEQ_ROW       29   // y[D] = x[row_idx * D : (row_idx+1) * D] — row pick from [T,D]
+#define NT_OP_TRIPLET_LOSS  30   // scalar = relu(margin + dot(a,n) - dot(a,p)) — SPA contrastive
 
 typedef struct {
     nt_tensor* output;          // forward result
@@ -316,6 +318,21 @@ int nt_sigmoid(int x_idx);
 // Broadcast scale: y[i] = a[0] * x[i], where a is a scalar tensor (shape [1]).
 // Grad flows to both x (gx = a*gy) and a (ga = sum(gy*x)).
 int nt_scale_by_t(int x_idx, int a_idx);
+
+// Pick row from sequence tensor: y[D] = x[row_idx * D : (row_idx + 1) * D].
+// x is a [T, D] tape entry (flat len = T*D). Backward: grad flows only into
+// that one row of x, others stay zero. Used to gather last-boundary token
+// embeddings for SPA sentence pooling.
+int nt_seq_row(int x_idx, int row_idx, int D);
+
+// Triplet contrastive loss with margin + hinge, fused into a single op:
+//   sim_pos = dot(anchor, pos); sim_neg = dot(anchor, neg)
+//   loss    = max(0, margin + sim_neg - sim_pos)
+// Returns a scalar tape entry. When the hinge is active (loss > 0), backward
+// distributes gradients as: d/d_anchor = neg - pos; d/d_pos = -anchor;
+// d/d_neg = anchor. When loss = 0, all three grads are zero.
+// All three inputs must be 1-D tensors of identical length.
+int nt_triplet_loss(int anchor_idx, int pos_idx, int neg_idx, float margin);
 
 // GEGLU: y = GELU(x @ W1) * (x @ W2) — Gemma-3 style FFN
 int nt_geglu(int x_idx, int w1_idx, int w2_idx, int T, int D_in, int D_out);

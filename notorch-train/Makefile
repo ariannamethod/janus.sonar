@@ -17,7 +17,15 @@ endif
 
 .PHONY: all clean
 
-all: train_janus_sonar infer_janus_sonar infer_janus_sonar_chain train_janus_sft
+all: train_janus_sonar infer_janus_sonar infer_janus_sonar_chain train_janus_sft train_sonar_spa test_sonar_ops
+
+train_sonar_spa: train_sonar_spa.c notorch.c notorch.h
+	$(CC) $(CFLAGS) $(BLAS_FLAGS) -o train_sonar_spa train_sonar_spa.c notorch.c -lm
+	@echo "Compiled: train_sonar_spa (single v2 + SPA contrastive, $(BLAS_NAME))"
+
+test_sonar_ops: test_sonar_ops.c notorch.c notorch.h
+	$(CC) $(CFLAGS) $(BLAS_FLAGS) -o test_sonar_ops test_sonar_ops.c notorch.c -lm
+	@echo "Compiled: test_sonar_ops ($(BLAS_NAME))"
 
 train_janus_sonar: train_janus_sonar.c notorch.c notorch.h
 	$(CC) $(CFLAGS) $(BLAS_FLAGS) -o train_janus_sonar train_janus_sonar.c notorch.c -lm
