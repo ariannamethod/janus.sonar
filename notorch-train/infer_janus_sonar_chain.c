@@ -350,8 +350,8 @@ static void apply_rep_penalty(float* logits, const int* history, int hist_n) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 #define MW_HEBB_WINDOW  8
-#define MW_BIGRAM_W     0.0f    /* disabled — Dario blend conflicts with trained transformer */
-#define MW_HEBB_W       0.0f    /* disabled — same reason */
+#define MW_BIGRAM_W     0.0f    /* tried 0.15 + 0.6; both fragment or crush trained transformer */
+#define MW_HEBB_W       0.0f    /* tried 0.3; truncates sentences early */
 #define MW_WORD_GATE   -3.0f    /* logit penalty for mid-word bigram=0 (standalone filter) */
 #define MW_LOG_FLOOR   -5.0f    /* clip log(p) to prevent log(tiny) crushing */
 
