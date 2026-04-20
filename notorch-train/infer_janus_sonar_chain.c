@@ -343,6 +343,92 @@ static void apply_rep_penalty(float* logits, const int* history, int hist_n) {
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * METAWEIGHTS — explicit corpus statistics (PostGPT-style), blended
+ * into logits at emission. Transformer provides A (destiny attraction);
+ * these provide B (bigram) + H (hebbian) + word-gate on bigram=0 mid-word.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#define MW_HEBB_WINDOW  8
+#define MW_BIGRAM_W     0.0f    /* disabled — Dario blend conflicts with trained transformer */
+#define MW_HEBB_W       0.0f    /* disabled — same reason */
+#define MW_WORD_GATE   -3.0f    /* logit penalty for mid-word bigram=0 (standalone filter) */
+#define MW_LOG_FLOOR   -5.0f    /* clip log(p) to prevent log(tiny) crushing */
+
+static float  g_mw_unigram[VOCAB];
+static float (*g_mw_bigram)[VOCAB]  = NULL;   /* 16 MB dense */
+static float (*g_mw_hebbian)[VOCAB] = NULL;   /* 16 MB dense */
+static int    g_mw_ready = 0;
+static const nt_bpe* g_bpe = NULL;
+
+static void mw_build(const int* ids, int n) {
+    if (!g_mw_bigram)  g_mw_bigram  = (float(*)[VOCAB])calloc(VOCAB, sizeof(*g_mw_bigram));
+    if (!g_mw_hebbian) g_mw_hebbian = (float(*)[VOCAB])calloc(VOCAB, sizeof(*g_mw_hebbian));
+    if (!g_mw_bigram || !g_mw_hebbian) return;
+    memset(g_mw_unigram, 0, sizeof(g_mw_unigram));
+    /* unigram */
+    for (int i = 0; i < n; i++)
+        if (ids[i] >= 0 && ids[i] < VOCAB) g_mw_unigram[ids[i]] += 1.0f;
+    float tot = 0; for (int i = 0; i < VOCAB; i++) tot += g_mw_unigram[i];
+    if (tot > 0) for (int i = 0; i < VOCAB; i++) g_mw_unigram[i] /= tot;
+    /* bigram rows, row-normalized */
+    for (int i = 0; i < n - 1; i++) {
+        int a = ids[i], b = ids[i+1];
+        if (a >= 0 && a < VOCAB && b >= 0 && b < VOCAB) g_mw_bigram[a][b] += 1.0f;
+    }
+    for (int a = 0; a < VOCAB; a++) {
+        float s = 0;
+        for (int b = 0; b < VOCAB; b++) s += g_mw_bigram[a][b];
+        if (s > 0) for (int b = 0; b < VOCAB; b++) g_mw_bigram[a][b] /= s;
+    }
+    /* hebbian, windowed, distance-decayed, global-max-normalized */
+    for (int i = 0; i < n; i++) {
+        int lo = i - MW_HEBB_WINDOW; if (lo < 0) lo = 0;
+        int hi = i + MW_HEBB_WINDOW + 1; if (hi > n) hi = n;
+        int a = ids[i]; if (a < 0 || a >= VOCAB) continue;
+        for (int j = lo; j < hi; j++) {
+            if (j == i) continue;
+            int b = ids[j]; if (b < 0 || b >= VOCAB) continue;
+            float d = 1.0f / (1.0f + (float)abs(i - j));
+            g_mw_hebbian[a][b] += d;
+        }
+    }
+    float mx = 0;
+    for (int a = 0; a < VOCAB; a++)
+        for (int b = 0; b < VOCAB; b++)
+            if (g_mw_hebbian[a][b] > mx) mx = g_mw_hebbian[a][b];
+    if (mx > 0) {
+        float inv = 1.0f / mx;
+        for (int a = 0; a < VOCAB; a++)
+            for (int b = 0; b < VOCAB; b++) g_mw_hebbian[a][b] *= inv;
+    }
+    g_mw_ready = 1;
+}
+
+static void mw_hebb_query(const int* ctx, int clen, float* out, int V) {
+    memset(out, 0, V * sizeof(float));
+    int take = clen < 4 ? clen : 4;
+    for (int k = clen - take; k < clen; k++) {
+        int c = ctx[k]; if (c < 0 || c >= VOCAB) continue;
+        for (int b = 0; b < V; b++) out[b] += g_mw_hebbian[c][b];
+    }
+    float mx = 0; for (int i = 0; i < V; i++) if (out[i] > mx) mx = out[i];
+    if (mx > 0) { float inv = 1.0f / mx; for (int i = 0; i < V; i++) out[i] *= inv; }
+}
+
+static int tok_ends_alpha(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    int len = g_bpe->token_len[tok]; if (len == 0) return 0;
+    unsigned char c = g_bpe->tokens[tok][len-1];
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+static int tok_starts_alpha(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    if (g_bpe->token_len[tok] == 0) return 0;
+    unsigned char c = g_bpe->tokens[tok][0];
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
 /* Sample from logits with AML field pre-applied (if field != NULL).
    Returns chosen token index. Also returns field-adjusted logits
    in `field_out` so caller can compute prophecy_debt. */
@@ -351,6 +437,33 @@ static int sample(float* logits, int n, float temp, float top_p,
                   const int* history, int hist_n) {
     if (history && hist_n > 0) apply_rep_penalty(logits, history, hist_n);
     if (field) aml_apply_field(logits, n, field);
+
+    /* ── Metaweight blend (PostGPT Dario-style) + word-gate ── */
+    if (g_mw_ready && history && hist_n > 0) {
+        int prev = history[hist_n - 1];
+        if (prev >= 0 && prev < VOCAB) {
+            int prev_alpha = tok_ends_alpha(prev);
+            for (int i = 0; i < n; i++) {
+                float p = g_mw_bigram[prev][i];
+                if (p > 1e-6f) {
+                    /* Seen bigram — soft log-prob pull, clipped */
+                    float lp = logf(p);
+                    if (lp < MW_LOG_FLOOR) lp = MW_LOG_FLOOR;
+                    logits[i] += MW_BIGRAM_W * lp;
+                } else if (prev_alpha && tok_starts_alpha(i)) {
+                    /* Word-gate: unseen bigram between alpha-edge tokens =
+                       likely orphaning a word. Soft downweight, not kill. */
+                    logits[i] += MW_WORD_GATE;
+                }
+                /* Otherwise (unseen bigram, not word-continuing) — no change.
+                   Lets transformer decide on punctuation/boundary tokens. */
+            }
+        }
+        float hebb[VOCAB];
+        mw_hebb_query(history, hist_n, hebb, n);
+        for (int i = 0; i < n; i++) logits[i] += MW_HEBB_W * hebb[i];
+    }
+
     if (field_out) memcpy(field_out, logits, n * sizeof(float));
 
     for (int i = 0; i < n; i++) logits[i] /= temp;
@@ -509,6 +622,32 @@ int main(int argc, char** argv) {
 
     Model* m = load_model(wpath);
     if (!m) return 1;
+
+    /* ── Metaweights: build explicit corpus statistics for inference blend ── */
+    g_bpe = &bpe;
+    {
+        const char* corpus_path = "../dataset_clean.txt";
+        FILE* cf = fopen(corpus_path, "rb");
+        if (cf) {
+            fseek(cf, 0, SEEK_END); long cfs = ftell(cf); fseek(cf, 0, SEEK_SET);
+            char* craw = (char*)malloc(cfs + 1);
+            if (craw) {
+                fread(craw, 1, cfs, cf); craw[cfs] = 0;
+                int* cenc = (int*)malloc(cfs * sizeof(int));
+                if (cenc) {
+                    int cnt = nt_bpe_encode(&bpe, craw, (int)cfs, cenc, (int)cfs);
+                    mw_build(cenc, cnt);
+                    printf("metaweights: corpus %.1f KB → %d tokens, tables ready\n",
+                           cfs / 1024.0, cnt);
+                    free(cenc);
+                }
+                free(craw);
+            }
+            fclose(cf);
+        } else {
+            printf("metaweights: %s not found — running transformer-only\n", corpus_path);
+        }
+    }
 
     nt_seed((unsigned)time(NULL));
     nt_train_mode(0);

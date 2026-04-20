@@ -34,6 +34,20 @@ All runs: 0 NaN on 8GB Mac. Tokenizer: Arianna BPE 2048 (`notorch-train/arianna_
 
 Post-v2 generation is **resonant schizo-genius** in the Sonar register: grammatical local structure, Sonar vocabulary (coin, bread, knock, loss function, radiator, architecture), creative collocations that recombine corpus fragments without literal repetition. `infer_janus_sonar_chain` wraps the base in calendar-drift compass, Schumann temperature modulation, best-of-3 candidates, SPA reseed of the weakest sentence, and full AML physics (destiny + suffering + laws + prophecy debt + Kuramoto chambers). At 3M the physics are doing real work on logits; semantic coherence is at the limit for this scale and is the next frontier (see roadmap).
 
+### Word-completion gate (inference, post-v1)
+
+BPE-salad ("ackitchen", "containtrained", "stoping") comes from the model emitting a token with alphabetic leading edge right after a token with alphabetic trailing edge, when that exact bigram never appeared in the corpus. The transformer doesn't know it's concatenating into a non-word.
+
+**Fix** (no retrain): at sample time, build `bigram[prev][next]` table once from `dataset_clean.txt`. For each candidate during generation:
+
+- If `bigram[prev][cand] > 0` (pair seen in corpus) — no change
+- Else if `prev ends with [a-zA-Z]` AND `cand starts with [a-zA-Z]` — apply logit penalty `MW_WORD_GATE = -3.0` (likely mid-word orphan)
+- Else — no change (transformer free to choose punctuation/boundary)
+
+Zero new ops, zero retrain, ~80 LOC in `infer_janus_sonar_chain.c`. Inspired by neoleo's word-boundary constraint and PostGPT's metaweight thesis.
+
+The PostGPT-style full Dario blend (bigram + hebbian + destiny in log-space) was implemented and tested but conflicts with an already-trained transformer: PostGPT seeds its transformer from metaweights, so the two align; here the transformer was trained standalone and an overlayed metaweight signal crushes its output distribution. Constants kept at zero (`MW_BIGRAM_W = MW_HEBB_W = 0.0`); infrastructure retained in the source for possible use at larger scale (30M) where transformer confidence is higher and a soft metaweight pull can co-exist.
+
 ### Sample output (v2, `sonar_single_v2.bin`)
 
 Chain inference shows each step as `[prompt-slice from seed]→[generated continuation]`. The chain picks a random 5-token sentence-boundary slice of the seed as prompt per step, not the end of the seed — this is a designed reseed behavior, not a bug.
