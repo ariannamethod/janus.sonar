@@ -14,7 +14,8 @@ The triple attention (MHA + RRPRAM + Janus Echo) compresses into ~1.5–2.25M pa
 
 | Model | Params | Steps | **Train best** | Val @ end | Notes |
 |-------|--------|-------|----------------|-----------|-------|
-| **`sonar_single_v2`** | **3.11M** | **10000** | **0.4947** | **2.2331** | **Current best. Single, deeper (L=6), clean dataset (speaker-tag em-dash stripped).** |
+| `sonar_spa_v1` | 3.11M | 10000 | 0.9660 | 2.6779 | Same base + SPA contrastive dual-loss (margin=0.3, weight=0.1, memory-bank neg). 0 NaN in 22236s (370 min, 2× forward per step). Pure-LM worse than v2 (expected trade-off); qualitative gen shift: longer narrative arcs, self-referential (`"the shape of Janus and answer"`, `"coin has been trained on"`). BPE-salad persists (vocab-2048 artifact). |
+| **`sonar_single_v2`** | **3.11M** | **10000** | **0.4947** | **2.2331** | **Pure-LM best. Single, deeper (L=6), clean dataset (speaker-tag em-dash stripped).** |
 | `microjanus_single_10k` | 1.57M | 5000 + resume 5000 | 1.22 | 2.70 | Single weight, L=4, dash-heavy dataset. |
 | `microjanus_dual_sym_5k` | 2.25M | 5000 | 1.55 | 3.32 | Dual, α_init=0 → σ=0.5. α did not move. |
 | `microjanus_dual_asym_5k` | 2.25M | 5000 | 1.84 | 3.36 | Dual, α_init=2 → σ=0.88, W_B×0.5. α did not diverge. |
