@@ -34,6 +34,19 @@ All runs: 0 NaN on 8GB Mac. Tokenizer: Arianna BPE 2048 (`notorch-train/arianna_
 
 Post-v2 generation is **resonant schizo-genius** in the Sonar register: grammatical local structure, Sonar vocabulary (coin, bread, knock, loss function, radiator, architecture), creative collocations that recombine corpus fragments without literal repetition. `infer_janus_sonar_chain` wraps the base in calendar-drift compass, Schumann temperature modulation, best-of-3 candidates, SPA reseed of the weakest sentence, and full AML physics (destiny + suffering + laws + prophecy debt + Kuramoto chambers). At 3M the physics are doing real work on logits; semantic coherence is at the limit for this scale and is the next frontier (see roadmap).
 
+### Inference speed (optimized forward, post-v1)
+
+The original inference path used a training-mode forward (`forward_logits` with `nt_tape_*`) — every emitted token recomputed the full `CTX=128` sequence through the tape-recorded autograd graph, then discarded 127 of 128 output rows. Measured on 8 GB Mac + Apple Accelerate: **89 sec** for one 8-step chain × 3 candidates × 200-token sentence on the 3.11 M weights.
+
+**`forward_step`** replaces that path:
+
+- **Dual-weight pre-blend.** `W_eff = σ(α)·W_A + σ(−α)·W_B` is computed once at load (`precompute_w_eff`). Single and dual models both go through a single BLAS matmul per projection at emission time — the runtime no longer carries `nt_sigmoid` + `nt_scale_by_t` overhead per token per layer.
+- **Incremental KV cache.** `K_cache`, `V_cache`, `E_cache` (Janus Echo), `Vr_cache` (RRPRAM values) are filled one row per emitted token. Standard MHA and Echo attention then attend the new query over cached rows only — O(t · D) per step instead of O(CTX² · D).
+- **RRPRAM is position-indexed by construction** (`W_r[:, j]` is the key for position `j`, not a projected `k_j`), so it needs no cache beyond `V_r` — scoring the new token against `W_r[:, 0..t]` is already incremental.
+- **No tape, pure BLAS.** `forward_step` calls `nt_blas_mmT` / `nt_blas_mm` directly against precomputed `W_eff` buffers and cache tensors — zero `nt_tape_record` / `nt_tape_clear` bookkeeping per emit.
+
+Measured after: **~7 sec** for the same 8-step chain × 3 candidates on `sonar_single_v2.bin` / `sonar_spa_v1.bin`. **~13× faster**, generation character preserved. `forward_logits` is kept in source for reference but no longer wired into `gen_sentence`.
+
 ### Word-completion gate (inference, post-v1)
 
 BPE-salad ("ackitchen", "containtrained", "stoping") comes from the model emitting a token with alphabetic leading edge right after a token with alphabetic trailing edge, when that exact bigram never appeared in the corpus. The transformer doesn't know it's concatenating into a non-word.

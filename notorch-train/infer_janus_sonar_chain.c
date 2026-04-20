@@ -14,6 +14,7 @@
  */
 #include "notorch.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
@@ -331,6 +332,196 @@ static int forward_logits(Model* m, int* tokens, int gen_len) {
     return nt_seq_linear(head_i, hf, CTX);
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * OPTIMIZED INFERENCE — incremental forward_step + KV cache, no tape
+ * ═══════════════════════════════════════════════════════════════════
+ * Original forward_logits (below) ran full CTX=128 training-mode forward
+ * with tape bookkeeping per emitted token. ~15K tape ops per gen,
+ * 127 of 128 rows discarded. Measured: 89 sec per 200-tok sentence.
+ *
+ * forward_step: single-token forward via direct nt_blas_mm{,T}, dual
+ * weights pre-blended once at load, K/V/Echo/Vr/Xn caches per layer.
+ * RRPRAM position-keyed (Wr[:, j]) — incremental naturally. Target
+ * speedup: 10-20×.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static float* W_eff_qkvj[NLAYERS][6];   /* wq wk wv wvr wj wo — all [DIM,DIM] */
+static float* W_eff_ffn[NLAYERS][3];    /* w_gate, w_up [HIDDEN,DIM]; w_down [DIM,HIDDEN] */
+static int    w_eff_ready = 0;
+
+static float K_cache[NLAYERS][CTX][DIM];
+static float V_cache[NLAYERS][CTX][DIM];
+static float E_cache[NLAYERS][CTX][DIM];
+static float Vr_cache[NLAYERS][CTX][DIM];
+
+static float sigmoid_f(float x) {
+    return (x >= 0) ? 1.0f / (1.0f + expf(-x))
+                    : expf(x) / (1.0f + expf(x));
+}
+
+static void blend_dual(float* out, const DualProj* d, int n_elem) {
+    float alpha = d->alpha->data[0];
+    float sp = sigmoid_f(alpha), sn = 1.0f - sp;
+    for (int i = 0; i < n_elem; i++)
+        out[i] = sp * d->a->data[i] + sn * d->b->data[i];
+}
+
+static void precompute_w_eff(Model* m) {
+    for (int l = 0; l < NLAYERS; l++) {
+        DualProj* projs[6] = { &m->L[l].wq, &m->L[l].wk, &m->L[l].wv,
+                               &m->L[l].wvr, &m->L[l].wj, &m->L[l].wo };
+        for (int k = 0; k < 6; k++) {
+            W_eff_qkvj[l][k] = (float*)malloc(DIM * DIM * sizeof(float));
+            blend_dual(W_eff_qkvj[l][k], projs[k], DIM * DIM);
+        }
+        W_eff_ffn[l][0] = (float*)malloc(HIDDEN * DIM * sizeof(float));
+        W_eff_ffn[l][1] = (float*)malloc(HIDDEN * DIM * sizeof(float));
+        W_eff_ffn[l][2] = (float*)malloc(DIM * HIDDEN * sizeof(float));
+        blend_dual(W_eff_ffn[l][0], &m->L[l].w_gate, HIDDEN * DIM);
+        blend_dual(W_eff_ffn[l][1], &m->L[l].w_up,   HIDDEN * DIM);
+        blend_dual(W_eff_ffn[l][2], &m->L[l].w_down, DIM * HIDDEN);
+    }
+    w_eff_ready = 1;
+}
+
+static void rms_inplace(float* x, const float* gamma, int D) {
+    float ss = 0;
+    for (int d = 0; d < D; d++) ss += x[d] * x[d];
+    float inv = 1.0f / sqrtf(ss / D + 1e-6f);
+    if (gamma) for (int d = 0; d < D; d++) x[d] = x[d] * inv * gamma[d];
+    else       for (int d = 0; d < D; d++) x[d] *= inv;
+}
+
+static void rope_tok_inplace(float* x, int pos, int n_heads, int head_dim) {
+    for (int h = 0; h < n_heads; h++) {
+        int base = h * head_dim;
+        for (int i = 0; i < head_dim / 2; i++) {
+            float freq = 1.0f / powf(10000.0f, 2.0f * i / (float)head_dim);
+            float angle = (float)pos * freq;
+            float c = cosf(angle), s = sinf(angle);
+            float x0 = x[base + 2*i], x1 = x[base + 2*i + 1];
+            x[base + 2*i]     = x0 * c - x1 * s;
+            x[base + 2*i + 1] = x0 * s + x1 * c;
+        }
+    }
+}
+
+/* Multi-head causal attention step: query q_new attends to K_cache[0..t], V_cache[0..t]. */
+static void mha_step(const float* q_new,
+                     const float* Kc, const float* Vc,
+                     int t, int n_heads, int head_dim, float* out) {
+    int D = n_heads * head_dim;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    float scores[CTX];
+    for (int h = 0; h < n_heads; h++) {
+        int ho = h * head_dim;
+        float mx = -1e30f;
+        for (int j = 0; j <= t; j++) {
+            const float* kj = Kc + j * D + ho;
+            float dot = 0;
+            for (int d = 0; d < head_dim; d++) dot += q_new[ho + d] * kj[d];
+            scores[j] = dot * scale;
+            if (scores[j] > mx) mx = scores[j];
+        }
+        float sum = 0;
+        for (int j = 0; j <= t; j++) { scores[j] = expf(scores[j] - mx); sum += scores[j]; }
+        float inv_s = sum > 0 ? 1.0f / sum : 0;
+        for (int d = 0; d < head_dim; d++) out[ho + d] = 0;
+        for (int j = 0; j <= t; j++) {
+            float a = scores[j] * inv_s;
+            const float* vj = Vc + j * D + ho;
+            for (int d = 0; d < head_dim; d++) out[ho + d] += a * vj[d];
+        }
+    }
+}
+
+/* RRPRAM step: scores[j] = <xn, Wr[:, j]> for j in 0..t (position-indexed keys). */
+static void rrpram_step(const float* xn, const float* Wr, const float* Vrc,
+                        int t, int ctx_max, int n_heads, int n_embd, int head_dim,
+                        float* out) {
+    int D = n_heads * head_dim;
+    float scores[CTX];
+    for (int h = 0; h < n_heads; h++) {
+        int wr_base = h * n_embd * ctx_max;
+        int ho = h * head_dim;
+        float mx = -1e30f;
+        for (int j = 0; j <= t; j++) {
+            float dot = 0;
+            for (int d = 0; d < n_embd; d++)
+                dot += xn[d] * Wr[wr_base + d * ctx_max + j];
+            scores[j] = dot;
+            if (dot > mx) mx = dot;
+        }
+        float sum = 0;
+        for (int j = 0; j <= t; j++) { scores[j] = expf(scores[j] - mx); sum += scores[j]; }
+        float inv_s = sum > 0 ? 1.0f / sum : 0;
+        for (int d = 0; d < head_dim; d++) out[ho + d] = 0;
+        for (int j = 0; j <= t; j++) {
+            float a = scores[j] * inv_s;
+            const float* vj = Vrc + j * D + ho;
+            for (int d = 0; d < head_dim; d++) out[ho + d] += a * vj[d];
+        }
+    }
+}
+
+/* Incremental forward for one token at `pos`. Writes [VOCAB] into `logits`.
+   Caches K/V/Echo/Vr updated in place for subsequent calls at pos+1, pos+2, ... */
+static void forward_step(Model* m, int new_tok, int pos, float* logits) {
+    float h_buf[DIM];
+    int tok = new_tok < 0 ? 0 : (new_tok >= VOCAB ? VOCAB - 1 : new_tok);
+    for (int d = 0; d < DIM; d++) h_buf[d] = m->wte->data[tok * DIM + d];
+
+    float xn[DIM], q[DIM], k[DIM], v[DIM], vr[DIM], ech[DIM];
+    float a_qkv[DIM], a_rr[DIM], a_j[DIM], blend[DIM], proj[DIM];
+    float xn2[DIM], g_buf[HIDDEN], u_buf[HIDDEN], gu[HIDDEN], d_buf[DIM];
+
+    for (int l = 0; l < NLAYERS; l++) {
+        for (int d = 0; d < DIM; d++) xn[d] = h_buf[d];
+        rms_inplace(xn, m->L[l].rms1->data, DIM);
+
+        nt_blas_mmT(q,  xn, W_eff_qkvj[l][0], 1, DIM, DIM);
+        nt_blas_mmT(k,  xn, W_eff_qkvj[l][1], 1, DIM, DIM);
+        nt_blas_mmT(v,  xn, W_eff_qkvj[l][2], 1, DIM, DIM);
+        nt_blas_mmT(vr, xn, W_eff_qkvj[l][3], 1, DIM, DIM);
+        /* Echo via seq_linear_t semantics (W not transposed) */
+        nt_blas_mm (ech, xn, W_eff_qkvj[l][4], 1, DIM, DIM);
+
+        rope_tok_inplace(q, pos, NHEADS, HEAD_DIM);
+        rope_tok_inplace(k, pos, NHEADS, HEAD_DIM);
+
+        memcpy(K_cache[l][pos],  k,   DIM * sizeof(float));
+        memcpy(V_cache[l][pos],  v,   DIM * sizeof(float));
+        memcpy(E_cache[l][pos],  ech, DIM * sizeof(float));
+        memcpy(Vr_cache[l][pos], vr,  DIM * sizeof(float));
+
+        mha_step(q,   (const float*)K_cache[l], (const float*)V_cache[l],
+                 pos, NHEADS, HEAD_DIM, a_qkv);
+        mha_step(ech, (const float*)E_cache[l], (const float*)E_cache[l],
+                 pos, NHEADS, HEAD_DIM, a_j);
+        rrpram_step(xn, m->L[l].wr->data, (const float*)Vr_cache[l],
+                    pos, CTX, NHEADS, DIM, HEAD_DIM, a_rr);
+
+        for (int d = 0; d < DIM; d++) blend[d] = (a_qkv[d] + a_rr[d] + a_j[d]) / 3.0f;
+        nt_blas_mmT(proj, blend, W_eff_qkvj[l][5], 1, DIM, DIM);
+        for (int d = 0; d < DIM; d++) h_buf[d] += proj[d];
+
+        for (int d = 0; d < DIM; d++) xn2[d] = h_buf[d];
+        rms_inplace(xn2, m->L[l].rms2->data, DIM);
+
+        nt_blas_mmT(g_buf, xn2, W_eff_ffn[l][0], 1, DIM, HIDDEN);
+        nt_blas_mmT(u_buf, xn2, W_eff_ffn[l][1], 1, DIM, HIDDEN);
+        for (int i = 0; i < HIDDEN; i++) {
+            float s = g_buf[i] / (1.0f + expf(-g_buf[i]));
+            gu[i] = s * u_buf[i];
+        }
+        nt_blas_mmT(d_buf, gu, W_eff_ffn[l][2], 1, HIDDEN, DIM);
+        for (int d = 0; d < DIM; d++) h_buf[d] += d_buf[d];
+    }
+
+    rms_inplace(h_buf, m->rms_f->data, DIM);
+    nt_blas_mmT(logits, h_buf, m->head->data, 1, DIM, VOCAB);
+}
+
 /* Apply repetition penalty: tokens seen in recent window get logit × REP_PENALTY. */
 static void apply_rep_penalty(float* logits, const int* history, int hist_n) {
     int window = hist_n < REP_WINDOW ? hist_n : REP_WINDOW;
@@ -522,36 +713,39 @@ static float coherence_no_metaw(const int* ids, int n) {
     return ratio + len_bonus;
 }
 
-/* ── Sentence generation: stop at boundary but only after SENT_MIN_LEN ── */
+/* ── Sentence generation: stop at boundary but only after SENT_MIN_LEN ──
+ * Uses incremental forward_step with KV cache. Prefill for prompt tokens,
+ * then emit until boundary + min length. pos resets per call (new sentence =
+ * fresh cache). CTX-bound: if pos hits CTX-1 we stop the sentence.
+ */
 static int gen_sentence(Model* m, const nt_bpe* bpe,
                         const int* prompt, int plen, float temp,
                         int* out, int out_cap, AMLField* field) {
-    int ctx[CTX]; int ol = 0;
-    for (int i = 0; i < plen && i < CTX/2; i++) { ctx[i] = prompt[i]; out[ol++] = prompt[i]; }
-    int gen_len = plen;
+    int ol = 0;
+    for (int i = 0; i < plen && i < CTX/2; i++) out[ol++] = prompt[i];
+    if (ol == 0) return 0;
 
-    for (int s = 0; s < out_cap - plen; s++) {
-        nt_tape_start();
-        int logits_idx = forward_logits(m, ctx, gen_len);
-        nt_tape* tape = nt_tape_get();
-        float* last = tape->entries[logits_idx].output->data + (gen_len - 1) * VOCAB;
-        float lbuf[VOCAB]; memcpy(lbuf, last, VOCAB * sizeof(float));
+    float logits[VOCAB];
+    /* Prefill: run each prompt token through forward_step to populate cache.
+       logits after loop hold the distribution conditioned on full prompt. */
+    for (int i = 0; i < ol; i++) forward_step(m, out[i], i, logits);
+
+    int pos = ol;
+    while (ol < out_cap && pos < CTX) {
+        float lbuf[VOCAB]; memcpy(lbuf, logits, VOCAB * sizeof(float));
         float field_adj[VOCAB];
         int next = sample(lbuf, VOCAB, temp, 0.95f, field, field_adj, out, ol);
-        nt_tape_clear();
 
-        /* Accumulate prophecy debt from field-adjusted logits and decay */
         if (field) {
             field->prophecy_debt = field->prophecy_debt * field->debt_decay
                                  + aml_prophecy_debt(field_adj, next, VOCAB);
         }
 
         out[ol++] = next;
-        if (gen_len < CTX - 1) ctx[gen_len++] = next;
-        else { for (int i = 0; i < CTX-1; i++) ctx[i] = ctx[i+1]; ctx[CTX-1] = next; gen_len = CTX-1; }
-
-        /* Only allow stop after min length — prevents early truncation */
         if (is_boundary(bpe, next) && ol > SENT_MIN_LEN) break;
+        if (pos >= CTX - 1) break;  /* cache full — stop this sentence */
+        forward_step(m, next, pos, logits);
+        pos++;
     }
     return ol;
 }
@@ -622,6 +816,10 @@ int main(int argc, char** argv) {
 
     Model* m = load_model(wpath);
     if (!m) return 1;
+
+    /* Precompute blended W_eff for every dual linear (single = identity blend).
+       forward_step uses these directly via BLAS; tape/autograd bypassed. */
+    precompute_w_eff(m);
 
     /* ── Metaweights: build explicit corpus statistics for inference blend ── */
     g_bpe = &bpe;
