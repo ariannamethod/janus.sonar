@@ -303,6 +303,7 @@ int main(int argc, char** argv) {
     printf("corpus: %.1f KB → %d BPE tokens\n", fsize/1024.0, n_tokens);
 
     nt_seed(42);
+    srand(42);
     Model* model = model_new();
     long np = count_params(model);
     printf("model: %ld params (%.2f MB) — single\n", np, np*4.0f/1048576.0f);

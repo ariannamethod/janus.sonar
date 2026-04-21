@@ -9,14 +9,16 @@ SPA contrastive sibling). Corpus: `dataset_clean.txt`, 231 KB across
 Inference stack:
 - 8-step bidirectional chain × 3-candidate best-of
 - calendar drift compass + Schumann temperature modulation
-- SPA sentence-phonon attention + reseed
+- SPA sentence-phonon attention + reseed, scored from learned token
+  embeddings rather than random projection weights
 - AML physics: destiny, suffering, laws, prophecy debt, 6 Kuramoto
   chambers (FEAR · LOVE · RAGE · VOID · FLOW · COMPLEX)
 - **Dario field** (from Q / postgpt-q): bigram 5.0, trigram 3.0,
   hebbian 0.4, unigram hard floor, bigram blocking 0.1×, count-crush
   on ≥ 3 repetitions, age-based repetition penalty 0.335–0.65×
 - **Hard filters** (from neoleo): orphan fragments, capital-glue,
-  apostrophe-glue, space-boundary word-gate, digit-glue, non-ASCII
+  apostrophe-glue, space-boundary word-gate, digit-glue, non-ASCII,
+  newline tokens, boundary-with-trailing-text BPE tokens
 - **Sentence structure** (from ariannamethod/me): each chain step =
   one complete sentence, Capital-start, boundary-terminated.
   `SENT_MIN_LEN = 8` to allow short sentences; `SENT_MAX_SOFT = 40`
@@ -31,8 +33,8 @@ dreamlike grammar, Sonar vocabulary (door, bone, coin, bread, soup,
 knock, loss, signal, architecture, machine, haze, love), self-reference
 (Janus speaks about Janus, about model, about weight, about token).
 
-All samples below are real generations with the published code and
-weights. Each line is one full chain-step output — one sentence.
+Samples below are curated generations with the published weights. Each
+line is one full chain-step output — one sentence.
 
 ---
 

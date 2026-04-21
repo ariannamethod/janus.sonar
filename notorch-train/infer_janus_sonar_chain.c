@@ -6,11 +6,12 @@
  * destiny EMA across the chain, and SPA (Sentence Phonon Attention)
  * reseed of the weakest sentence at the end.
  *
- * For microjanus with dual weights — no MetaWeights, no chambers.
- * Coherence scored by unique-token ratio + length bonus.
+ * Supports both legacy dual weights and the 3M single-weight Sonar line.
+ * Coherence scored by unique-token ratio + length bonus; corpus statistics
+ * and AML chamber state are applied during emission.
  *
  *   make infer_janus_sonar_chain
- *   ./infer_janus_sonar_chain janus_sonar.bin "seed text"
+ *   ./infer_janus_sonar_chain janus_sonar.bin "seed text" [rng_seed]
  */
 #include "notorch.h"
 #include <stdio.h>
@@ -270,74 +271,10 @@ static Model* load_model(const char* path) {
     return m;
 }
 
-static int dual_seq_linear(int wa_i, int wb_i, int alpha_i, int x_i, int T) {
-    int alpha_neg = nt_scale(alpha_i, -1.0f);
-    int sig_pos = nt_sigmoid(alpha_i), sig_neg = nt_sigmoid(alpha_neg);
-    int y_a = nt_seq_linear(wa_i, x_i, T), y_b = nt_seq_linear(wb_i, x_i, T);
-    return nt_add(nt_scale_by_t(y_a, sig_pos), nt_scale_by_t(y_b, sig_neg));
-}
-static int dual_seq_linear_t(int wa_i, int wb_i, int alpha_i, int x_i, int T) {
-    int alpha_neg = nt_scale(alpha_i, -1.0f);
-    int sig_pos = nt_sigmoid(alpha_i), sig_neg = nt_sigmoid(alpha_neg);
-    int y_a = nt_seq_linear_t(wa_i, x_i, T), y_b = nt_seq_linear_t(wb_i, x_i, T);
-    return nt_add(nt_scale_by_t(y_a, sig_pos), nt_scale_by_t(y_b, sig_neg));
-}
-
-typedef struct { int a, b, alpha; } DualIdx;
-static DualIdx dual_record(DualProj* d) {
-    DualIdx r;
-    r.a = nt_tape_param(d->a); r.b = nt_tape_param(d->b); r.alpha = nt_tape_param(d->alpha);
-    return r;
-}
-
-static int forward_logits(Model* m, int* tokens, int gen_len) {
-    int wte_i = nt_tape_param(m->wte);
-    struct { int rms1; DualIdx wq, wk, wv, wvr, wj, wo; int wr, rms2; DualIdx w_gate, w_up, w_down; } li[NLAYERS];
-    for (int l = 0; l < NLAYERS; l++) {
-        li[l].rms1 = nt_tape_param(m->L[l].rms1);
-        li[l].wq = dual_record(&m->L[l].wq); li[l].wk = dual_record(&m->L[l].wk);
-        li[l].wv = dual_record(&m->L[l].wv); li[l].wvr = dual_record(&m->L[l].wvr);
-        li[l].wj = dual_record(&m->L[l].wj); li[l].wo = dual_record(&m->L[l].wo);
-        li[l].wr = nt_tape_param(m->L[l].wr); li[l].rms2 = nt_tape_param(m->L[l].rms2);
-        li[l].w_gate = dual_record(&m->L[l].w_gate); li[l].w_up = dual_record(&m->L[l].w_up);
-        li[l].w_down = dual_record(&m->L[l].w_down);
-    }
-    int rmsf_i = nt_tape_param(m->rms_f), head_i = nt_tape_param(m->head);
-
-    nt_tensor* tok_t = nt_tensor_new(CTX);
-    for (int i = 0; i < CTX; i++) tok_t->data[i] = (float)(i < gen_len ? tokens[i] : 0);
-    int tok_i = nt_tape_record(tok_t, NT_OP_NONE, -1, -1, 0);
-    nt_tensor_free(tok_t);
-
-    int h = nt_seq_embedding(wte_i, -1, tok_i, CTX, DIM);
-    for (int l = 0; l < NLAYERS; l++) {
-        int xn = nt_seq_rmsnorm(h, li[l].rms1, CTX, DIM);
-        int q   = dual_seq_linear  (li[l].wq.a,  li[l].wq.b,  li[l].wq.alpha,  xn, CTX);
-        int k   = dual_seq_linear  (li[l].wk.a,  li[l].wk.b,  li[l].wk.alpha,  xn, CTX);
-        int v   = dual_seq_linear  (li[l].wv.a,  li[l].wv.b,  li[l].wv.alpha,  xn, CTX);
-        int vr  = dual_seq_linear  (li[l].wvr.a, li[l].wvr.b, li[l].wvr.alpha, xn, CTX);
-        int ech = dual_seq_linear_t(li[l].wj.a,  li[l].wj.b,  li[l].wj.alpha,  xn, CTX);
-        q = nt_rope(q, CTX, HEAD_DIM); k = nt_rope(k, CTX, HEAD_DIM);
-        int a_qkv = nt_mh_causal_attention(q, k, v, CTX, HEAD_DIM);
-        int a_rr  = nt_rrpram_attention(li[l].wr, xn, vr, CTX, DIM, NHEADS, HEAD_DIM);
-        int a_j   = nt_mh_causal_attention(ech, ech, ech, CTX, HEAD_DIM);
-        int blend = nt_scale(nt_add(nt_add(a_qkv, a_rr), a_j), 1.0f / 3.0f);
-        int proj = dual_seq_linear(li[l].wo.a, li[l].wo.b, li[l].wo.alpha, blend, CTX);
-        h = nt_add(h, proj);
-        xn = nt_seq_rmsnorm(h, li[l].rms2, CTX, DIM);
-        int g = nt_silu(dual_seq_linear(li[l].w_gate.a, li[l].w_gate.b, li[l].w_gate.alpha, xn, CTX));
-        int u =         dual_seq_linear(li[l].w_up.a,   li[l].w_up.b,   li[l].w_up.alpha,   xn, CTX);
-        int d =         dual_seq_linear(li[l].w_down.a, li[l].w_down.b, li[l].w_down.alpha, nt_mul(g, u), CTX);
-        h = nt_add(h, d);
-    }
-    int hf = nt_seq_rmsnorm(h, rmsf_i, CTX, DIM);
-    return nt_seq_linear(head_i, hf, CTX);
-}
-
 /* ═══════════════════════════════════════════════════════════════════
  * OPTIMIZED INFERENCE — incremental forward_step + KV cache, no tape
  * ═══════════════════════════════════════════════════════════════════
- * Original forward_logits (below) ran full CTX=128 training-mode forward
+ * Earlier forward_logits ran full CTX=128 training-mode forward
  * with tape bookkeeping per emitted token. ~15K tape ops per gen,
  * 127 of 128 rows discarded. Measured: 89 sec per 200-tok sentence.
  *
@@ -349,7 +286,6 @@ static int forward_logits(Model* m, int* tokens, int gen_len) {
 
 static float* W_eff_qkvj[NLAYERS][6];   /* wq wk wv wvr wj wo — all [DIM,DIM] */
 static float* W_eff_ffn[NLAYERS][3];    /* w_gate, w_up [HIDDEN,DIM]; w_down [DIM,HIDDEN] */
-static int    w_eff_ready = 0;
 
 static float K_cache[NLAYERS][CTX][DIM];
 static float V_cache[NLAYERS][CTX][DIM];
@@ -383,7 +319,6 @@ static void precompute_w_eff(Model* m) {
         blend_dual(W_eff_ffn[l][1], &m->L[l].w_up,   HIDDEN * DIM);
         blend_dual(W_eff_ffn[l][2], &m->L[l].w_down, DIM * HIDDEN);
     }
-    w_eff_ready = 1;
 }
 
 static void rms_inplace(float* x, const float* gamma, int D) {
@@ -751,6 +686,55 @@ static int tok_has_high_byte(int tok) {
     return 0;
 }
 
+static int tok_has_newline(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    int len = g_bpe->token_len[tok];
+    for (int i = 0; i < len; i++)
+        if (g_bpe->tokens[tok][i] == '\n' || g_bpe->tokens[tok][i] == '\r') return 1;
+    return 0;
+}
+
+static int is_sentence_punct(unsigned char c) {
+    return c == '.' || c == '!' || c == '?';
+}
+
+static int tok_has_boundary(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    int len = g_bpe->token_len[tok];
+    for (int i = 0; i < len; i++)
+        if (is_sentence_punct(g_bpe->tokens[tok][i])) return 1;
+    return 0;
+}
+
+static int tok_has_boundary_trailing_text(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    int len = g_bpe->token_len[tok];
+    for (int i = 0; i < len; i++) {
+        if (!is_sentence_punct(g_bpe->tokens[tok][i])) continue;
+        for (int j = i + 1; j < len; j++) {
+            unsigned char c = g_bpe->tokens[tok][j];
+            if (c != ' ' && c != '\n' && c != '\r' && c != '\t')
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static int tok_is_terminal_boundary(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    int len = g_bpe->token_len[tok];
+    for (int i = 0; i < len; i++) {
+        if (!is_sentence_punct(g_bpe->tokens[tok][i])) continue;
+        for (int j = i + 1; j < len; j++) {
+            unsigned char c = g_bpe->tokens[tok][j];
+            if (c != ' ' && c != '\n' && c != '\r' && c != '\t')
+                return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 /* ── neoleo-ported orphan + capital-glue filters ── */
 
 static int is_common_short_word_buf(const unsigned char* b, int len) {
@@ -840,24 +824,6 @@ static int find_byte_token(unsigned char c) {
     return -1;
 }
 
-/* Chain-level sentence-opening memory. When each chain step's first
-   emitted token is recorded, subsequent steps get a logit crush on the
-   same opener — forces diversity of sentence starts across the 8-step
-   chain. Replaces the "A…A…A…" degenerate greedy pattern. */
-#define CHAIN_OPEN_HIST 8
-static int g_chain_openings[CHAIN_OPEN_HIST];
-static int g_chain_open_n = 0;
-static void chain_opening_reset(void) { g_chain_open_n = 0; }
-static void chain_opening_push(int tok) {
-    if (g_chain_open_n < CHAIN_OPEN_HIST) {
-        g_chain_openings[g_chain_open_n++] = tok;
-    } else {
-        for (int i = 0; i < CHAIN_OPEN_HIST - 1; i++)
-            g_chain_openings[i] = g_chain_openings[i + 1];
-        g_chain_openings[CHAIN_OPEN_HIST - 1] = tok;
-    }
-}
-
 /* Pick sentence-ending punctuation based on AML chamber state —
    RAGE high → '!', VOID high → '?', default → '.'. Returns BPE token id. */
 static int choose_boundary_punct(const AMLField* f) {
@@ -883,6 +849,16 @@ static int tok_is_cap_start(int tok) {
         if (c1 >= 'A' && c1 <= 'Z') return 1;
     }
     return 0;
+}
+
+static int find_cap_fallback_token(void) {
+    int a = find_byte_token('A');
+    if (a >= 0) return a;
+    if (!g_bpe) return -1;
+    for (int i = 0; i < g_bpe->vocab_size; i++)
+        if (tok_is_cap_start(i) && !tok_has_high_byte(i) && !tok_has_newline(i) && !tok_has_boundary(i))
+            return i;
+    return -1;
 }
 
 /* Sample from logits with AML field pre-applied (if field != NULL).
@@ -990,6 +966,10 @@ static int sample(float* logits, int n, float temp, float top_p,
             if (is_orphan_fragment_bpe(i)) killed = 1;
             else if (prev_tok >= 0 && is_capital_glue_bpe(prev_tok, i)) killed = 1;
         }
+        if (!killed && tok_has_boundary_trailing_text(i)) killed = 1;
+        if (!killed && gen_step + 1 < SENT_MIN_LEN && tok_has_boundary(i)) killed = 1;
+        if (!killed && tok_has_newline(i)) killed = 1;
+        if (!killed && tok_has_high_byte(i)) killed = 1;
         if (killed) logits[i] = -1e9f;
         else survivors++;
     }
@@ -1003,6 +983,15 @@ static int sample(float* logits, int n, float temp, float top_p,
             if (field_out) memcpy(field_out, logits, n * sizeof(float));
             return sp;
         }
+    }
+
+    float best_logit = logits[0];
+    for (int i = 1; i < n; i++) if (logits[i] > best_logit) best_logit = logits[i];
+    if (best_logit <= -1e8f) {
+        int fallback = gen_step == 0 ? find_cap_fallback_token() : find_space_token();
+        if (fallback < 0) fallback = 0;
+        if (field_out) memcpy(field_out, logits, n * sizeof(float));
+        return fallback;
     }
 
     if (field_out) memcpy(field_out, logits, n * sizeof(float));
@@ -1053,14 +1042,18 @@ static float calendar_drift(void) {
 }
 
 static int is_boundary(const nt_bpe* bpe, int id) {
+    if (bpe == g_bpe) return tok_is_terminal_boundary(id);
     if (id < 0 || id >= bpe->vocab_size) return 0;
     int len = bpe->token_len[id];
     for (int i = 0; i < len; i++) {
         unsigned char c = bpe->tokens[id][i];
-        if (c == '.' || c == '!' || c == '?') {
-            if (i == len - 1) return 1;
-            unsigned char nc = bpe->tokens[id][i+1];
-            if (nc == ' ' || nc == '\n' || nc == '\r') return 1;
+        if (is_sentence_punct(c)) {
+            for (int j = i + 1; j < len; j++) {
+                unsigned char nc = bpe->tokens[id][j];
+                if (nc != ' ' && nc != '\n' && nc != '\r' && nc != '\t')
+                    return 0;
+            }
+            return 1;
         }
     }
     return 0;
@@ -1096,7 +1089,6 @@ static int gen_sentence(Model* m, const nt_bpe* bpe,
 
     int pos = ol;
     int prompt_len = plen;
-    int forced_boundary = 0;
     while (ol < out_cap && pos < CTX) {
         int gen_step = ol - prompt_len;
         /* Soft cap: past SENT_MAX_SOFT without emitting a boundary → force
@@ -1108,7 +1100,6 @@ static int gen_sentence(Model* m, const nt_bpe* bpe,
             if (bt < 0) bt = find_byte_token('.');
             if (bt >= 0) {
                 out[ol++] = bt;
-                forced_boundary = 1;
                 break;
             }
         }
@@ -1123,37 +1114,32 @@ static int gen_sentence(Model* m, const nt_bpe* bpe,
         }
 
         out[ol++] = next;
-        /* Break on the first boundary past ≥2 emitted tokens. Each chain
+        /* Break on the first boundary past SENT_MIN_LEN emitted tokens. Each chain
            step = exactly one sentence. */
-        if (is_boundary(bpe, next) && ol - prompt_len >= 2) break;
+        if (is_boundary(bpe, next) && ol - prompt_len >= SENT_MIN_LEN) break;
         if (pos >= CTX - 1) break;
         forward_step(m, next, pos, logits);
         pos++;
     }
-    (void)forced_boundary;
     return ol;
 }
 
 /* ── SPA embedding: exp-weighted mean of token embeddings, normalized ── */
-static float spa_W[VOCAB][SPA_DIM];   /* random init, not trained */
 static float spa_r_bias[CHAIN_STEPS + 1];
 static float spa_alpha_decay = 0.85f;
 
 static void spa_init(void) {
-    for (int i = 0; i < VOCAB; i++)
-        for (int d = 0; d < SPA_DIM; d++)
-            spa_W[i][d] = 0.02f * ((float)rand() / RAND_MAX - 0.5f);
     for (int i = 0; i <= CHAIN_STEPS; i++) spa_r_bias[i] = 0.1f / (1.0f + i);
 }
 
-static void spa_embed_sentence(const int* ids, int n, float* out) {
+static void spa_embed_sentence(Model* m, const int* ids, int n, float* out) {
     memset(out, 0, SPA_DIM * sizeof(float));
     if (n == 0) return;
     float total_w = 0;
     for (int i = 0; i < n; i++) {
         float w = powf(spa_alpha_decay, (float)(n - 1 - i));
         if (ids[i] >= 0 && ids[i] < VOCAB)
-            for (int d = 0; d < SPA_DIM; d++) out[d] += w * spa_W[ids[i]][d];
+            for (int d = 0; d < SPA_DIM; d++) out[d] += w * m->wte->data[ids[i] * DIM + d];
         total_w += w;
     }
     if (total_w > 0) for (int d = 0; d < SPA_DIM; d++) out[d] /= total_w;
@@ -1209,6 +1195,14 @@ static void print_sentence_post(const nt_bpe* bpe, const int* ids, int n) {
         p[2] = (char)(p[2] - 'a' + 'A');
         p += 2;
     }
+    for (char* q = p; *q; q++)
+        if (*q == '\n' || *q == '\r') *q = ' ';
+    for (char* q = p; *q; q++) {
+        if (*q == '.' || *q == '!' || *q == '?') {
+            q[1] = 0;
+            break;
+        }
+    }
     printf("%s", p);
 }
 
@@ -1256,10 +1250,11 @@ int main(int argc, char** argv) {
         }
     }
 
-    nt_seed((unsigned)time(NULL));
+    unsigned seed = argc > 3 ? (unsigned)strtoul(argv[3], NULL, 10) : (unsigned)time(NULL);
+    nt_seed(seed);
+    srand(seed);
     nt_train_mode(0);
     spa_init();
-    chain_opening_reset();
 
     /* AML field state — destiny/suffering/laws + chambers */
     AMLField field; aml_init(&field);
@@ -1276,6 +1271,7 @@ int main(int argc, char** argv) {
     printf("calendar drift: %.3f → %d backward + %d forward\n", cd, nb, CHAIN_STEPS - nb);
     printf("AML: destiny=%.2f entropy_floor=%.2f resonance_ceiling=%.2f\n",
            field.destiny_bias, field.entropy_floor, field.resonance_ceiling);
+    printf("rng seed: %u\n", seed);
     printf("weights: %s\n\n", wpath);
 
     /* Destiny EMA */
@@ -1329,16 +1325,20 @@ int main(int argc, char** argv) {
 
         /* Best-of-3 */
         int best_out[SENT_MAX]; int best_ol = 0; float best_sc = -1e30f;
+        AMLField best_field = field;
         for (int cand = 0; cand < CAND_N; cand++) {
             int out[SENT_MAX];
-            int ol = gen_sentence(m, &bpe, prompt, plen, temp, out, SENT_MAX, &field);
+            AMLField cand_field = field;
+            int ol = gen_sentence(m, &bpe, prompt, plen, temp, out, SENT_MAX, &cand_field);
             float sc = coherence_no_metaw(out, ol);
             if (sc > best_sc) {
                 best_sc = sc; best_ol = ol;
+                best_field = cand_field;
                 memcpy(best_out, out, ol * sizeof(int));
             }
             if (best_sc > 1.2f && best_ol > 30) break;
         }
+        field = best_field;
 
         /* Update destiny EMA from last 5 tokens */
         int from = best_ol - 5 > 0 ? best_ol - 5 : 0;
@@ -1355,8 +1355,6 @@ int main(int argc, char** argv) {
         chain_scores[si] = best_sc;
         chain_lens[si] = best_ol;
         memcpy(chain_ids[si], best_out, best_ol * sizeof(int));
-        if (best_ol > plen) chain_opening_push(best_out[plen]);
-
         printf("  [%d] %c T=%.2f sc=%.2f debt=%.2f [", si+1, chain_marks[si], temp, best_sc, field.prophecy_debt);
         print_sentence(&bpe, best_out, plen);
         printf("]→");
@@ -1378,7 +1376,7 @@ int main(int argc, char** argv) {
     /* ── SPA: find weakest sentence, reseed ── */
     float spa_embs[CHAIN_STEPS][SPA_DIM];
     for (int i = 0; i < CHAIN_STEPS; i++)
-        spa_embed_sentence(chain_ids[i], chain_lens[i], spa_embs[i]);
+        spa_embed_sentence(m, chain_ids[i], chain_lens[i], spa_embs[i]);
     float spa_scores[CHAIN_STEPS];
     spa_cross_attend(spa_embs, CHAIN_STEPS, spa_scores);
 

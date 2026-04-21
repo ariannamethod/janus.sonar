@@ -20,6 +20,12 @@
 
 static int g_failures = 0;
 
+static void copy_grad_or_zero(int tape_idx, float* dst, size_t bytes) {
+    nt_tape_entry* e = &nt_tape_get()->entries[tape_idx];
+    if (e->grad) memcpy(dst, e->grad->data, bytes);
+    else memset(dst, 0, bytes);
+}
+
 static void check_grad(const char* label, int idx, float expected, float actual) {
     float d = fabsf(expected - actual);
     float scale = fabsf(expected) > 1 ? fabsf(expected) : 1.0f;
@@ -125,9 +131,9 @@ static void test_triplet(const char* label, float a_scale, float p_scale, float 
         int li = nt_triplet_loss(ai, pi, ni, margin);
         baseline_loss = nt_tape_get()->entries[li].output->data[0];
         nt_tape_backward(li);
-        memcpy(ana_ga, nt_tape_get()->entries[ai].grad->data, sizeof(ana_ga));
-        memcpy(ana_gp, nt_tape_get()->entries[pi].grad->data, sizeof(ana_gp));
-        memcpy(ana_gn, nt_tape_get()->entries[ni].grad->data, sizeof(ana_gn));
+        copy_grad_or_zero(ai, ana_ga, sizeof(ana_ga));
+        copy_grad_or_zero(pi, ana_gp, sizeof(ana_gp));
+        copy_grad_or_zero(ni, ana_gn, sizeof(ana_gn));
         nt_tensor_free(a); nt_tensor_free(p); nt_tensor_free(n);
         nt_tape_clear();
     }
@@ -180,7 +186,7 @@ int main(void) {
     test_triplet("active", 1.0f, -1.0f, 1.0f);
 
     printf("[triplet_loss — INACTIVE regime (pos much more aligned than neg)]\n");
-    test_triplet("inactive", 1.0f, 1.0f, -1.0f);
+    test_triplet("inactive", 1.0f, 4.0f, -1.0f);
 
     if (g_failures == 0) {
         printf("\n== OK: all gradients match within %.3f ==\n", TOL_FD);

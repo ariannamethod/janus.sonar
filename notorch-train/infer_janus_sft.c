@@ -4,10 +4,11 @@
  * Same bidirectional chain as infer_janus_sonar_chain, but the Q/K/V
  * projections pick up the trained LoRA delta. Two .bin files loaded:
  *
- *   ./infer_janus_sft base.bin adapter.bin [seed text]
+ *   ./infer_janus_sft base.bin adapter.bin [seed text] [rng_seed]
  */
 #include "notorch.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
@@ -178,24 +179,21 @@ static float aml_prophecy_debt(const float* logits, int chosen, int n) {
 
 /* SPA */
 #define SPA_DIM 32
-static float spa_W[VOCAB][SPA_DIM];
 static float spa_r_bias[CHAIN_STEPS + 1];
 static float spa_alpha_decay = 0.85f;
 
 static void spa_init(void) {
-    for (int i = 0; i < VOCAB; i++)
-        for (int d = 0; d < SPA_DIM; d++) spa_W[i][d] = 0.02f * ((float)rand()/RAND_MAX - 0.5f);
     for (int i = 0; i <= CHAIN_STEPS; i++) spa_r_bias[i] = 0.1f / (1.0f + i);
 }
 
-static void spa_embed_sentence(const int* ids, int n, float* out) {
+static void spa_embed_sentence(Model* m, const int* ids, int n, float* out) {
     memset(out, 0, SPA_DIM*sizeof(float));
     if (n == 0) return;
     float tw = 0;
     for (int i = 0; i < n; i++) {
         float w = powf(spa_alpha_decay, (float)(n-1-i));
         if (ids[i] >= 0 && ids[i] < VOCAB)
-            for (int d = 0; d < SPA_DIM; d++) out[d] += w * spa_W[ids[i]][d];
+            for (int d = 0; d < SPA_DIM; d++) out[d] += w * m->wte->data[ids[i] * DIM + d];
         tw += w;
     }
     if (tw > 0) for (int d = 0; d < SPA_DIM; d++) out[d] /= tw;
@@ -241,9 +239,12 @@ static int is_boundary(const nt_bpe* bpe, int id) {
     for (int i = 0; i < len; i++) {
         unsigned char c = bpe->tokens[id][i];
         if (c == '.' || c == '!' || c == '?') {
-            if (i == len - 1) return 1;
-            unsigned char nc = bpe->tokens[id][i+1];
-            if (nc == ' ' || nc == '\n' || nc == '\r') return 1;
+            for (int j = i + 1; j < len; j++) {
+                unsigned char nc = bpe->tokens[id][j];
+                if (nc != ' ' && nc != '\n' && nc != '\r' && nc != '\t')
+                    return 0;
+            }
+            return 1;
         }
     }
     return 0;
@@ -423,7 +424,9 @@ int main(int argc, char** argv) {
     printf("base:    %s\n", bpath);
     printf("adapter: %s (LoRA rank=%d, α=%.0f)\n", apath, LORA_RANK, LORA_ALPHA);
 
-    nt_seed((unsigned)time(NULL));
+    unsigned seed = argc > 4 ? (unsigned)strtoul(argv[4], NULL, 10) : (unsigned)time(NULL);
+    nt_seed(seed);
+    srand(seed);
     nt_train_mode(0);
     spa_init();
     AMLField field; aml_init(&field);
@@ -475,13 +478,19 @@ int main(int argc, char** argv) {
         if (temp < 0.45f) temp = 0.45f; if (temp > 0.9f) temp = 0.9f;
 
         int best_out[SENT_MAX]; int best_ol = 0; float best_sc = -1e30f;
+        AMLField best_field = field;
         for (int cand = 0; cand < CAND_N; cand++) {
             int out[SENT_MAX];
-            int ol = gen_sentence(m, &bpe, prompt, plen, temp, out, SENT_MAX, &field);
+            AMLField cand_field = field;
+            int ol = gen_sentence(m, &bpe, prompt, plen, temp, out, SENT_MAX, &cand_field);
             float sc = coherence_no_metaw(out, ol);
-            if (sc > best_sc) { best_sc = sc; best_ol = ol; memcpy(best_out, out, ol*sizeof(int)); }
+            if (sc > best_sc) {
+                best_sc = sc; best_ol = ol; best_field = cand_field;
+                memcpy(best_out, out, ol*sizeof(int));
+            }
             if (best_sc > 1.2f && best_ol > 30) break;
         }
+        field = best_field;
 
         int from = best_ol - 5 > 0 ? best_ol - 5 : 0;
         for (int i = from; i < best_ol; i++) {
@@ -502,7 +511,7 @@ int main(int argc, char** argv) {
     }
 
     float embs[CHAIN_STEPS][SPA_DIM]; float scores[CHAIN_STEPS];
-    for (int i = 0; i < CHAIN_STEPS; i++) spa_embed_sentence(chain_ids[i], chain_lens[i], embs[i]);
+    for (int i = 0; i < CHAIN_STEPS; i++) spa_embed_sentence(m, chain_ids[i], chain_lens[i], embs[i]);
     spa_cross_attend(embs, CHAIN_STEPS, scores);
     float avg = 0; for (int i = 0; i < CHAIN_STEPS; i++) avg += scores[i]; avg /= CHAIN_STEPS;
     float mn = scores[0]; int weak = 0;

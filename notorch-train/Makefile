@@ -17,7 +17,7 @@ endif
 
 .PHONY: all clean
 
-all: train_janus_sonar infer_janus_sonar infer_janus_sonar_chain train_janus_sft train_sonar_spa test_sonar_ops
+all: train_janus_sonar infer_janus_sonar infer_janus_sonar_chain train_janus_sft infer_janus_sft train_sonar_spa test_sonar_ops
 
 train_sonar_spa: train_sonar_spa.c notorch.c notorch.h
 	$(CC) $(CFLAGS) $(BLAS_FLAGS) -o train_sonar_spa train_sonar_spa.c notorch.c -lm
@@ -48,4 +48,6 @@ infer_janus_sft: infer_janus_sft.c notorch.c notorch.h
 	@echo "Compiled: infer_janus_sft (base + LoRA adapter, $(BLAS_NAME))"
 
 clean:
-	rm -f train_janus_sonar infer_janus_sonar *.o
+	rm -f train_janus_sonar infer_janus_sonar infer_janus_sonar_chain
+	rm -f train_janus_sft infer_janus_sft train_sonar_spa test_sonar_ops
+	rm -f *.o

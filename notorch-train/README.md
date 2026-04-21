@@ -44,22 +44,22 @@ RRPRAM via `nt_rrpram_attention`, Janus Echo via `nt_seq_linear_t` — both alre
 ```bash
 # Build
 cd notorch-train/
-make train_janus_sonar
-make infer_janus_sonar
+make all
 
-# Train (5000 steps, ~30 min on 8GB Mac Accelerate)
-./train_janus_sonar 5000 3e-4
+# Train the current 3M single model
+./train_janus_sonar 10000 3e-4
 
 # Resume and continue
 ./train_janus_sonar --resume 5000 1.5e-4
 
-# Generate
-./infer_janus_sonar janus_sonar.bin "Q: What does Janus feel?\nA:" 150 0.7 0.95
+# Generate with the full chain stack
+./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "The knock came three times"
+./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "The knock came three times" 123  # deterministic seed
 ```
 
 Required input files:
-- `/tmp/janus-sonar/janus_sonar_dataset.txt` (symlink or adjust path in source) — 241K corpus, 16 voices
-- `arianna_bpe_merges.txt` — copy from `notorch/arianna_bpe_merges.txt`
+- `../dataset_clean.txt` — 231K corpus, 16 voices, used by training and inference metaweights
+- `arianna_bpe_merges.txt` — 1792 merges, vocab 2048
 
 ## Results (single-weights version, 2026-04-18)
 
@@ -104,20 +104,24 @@ ensemble of two Xavier-init matrices, not from learned blend.
 ## Files
 
 - `train_janus_sonar.c` — training program (~320 LOC)
-- `infer_janus_sonar.c` — single-pass inference (~200 LOC)
-- `infer_janus_sonar_chain.c` — **proper Janus inference** (~380 LOC):
+- `infer_janus_sonar.c` — legacy 4-layer dual-weight single-pass inference
+- `infer_janus_sonar_chain.c` — **proper Janus inference**:
   8-step bidirectional chain with calendar-drift compass (forward/backward
   ratio from Hebrew/Gregorian dissonance), Schumann resonance temperature
   modulation (7.83 Hz + harmonics), best-of-3 candidates per step with
   coherence scoring, destiny EMA across chain, and SPA (Sentence Phonon
-  Attention) reseed of the weakest sentence at the end. Sentences cannot
-  truncate before `SENT_MIN_LEN=18` tokens — prevents early cut-off.
-- `Makefile` targets `train_janus_sonar`, `infer_janus_sonar`, `infer_janus_sonar_chain`
+  Attention) reseed of the weakest sentence at the end. Best-of-3 evaluates
+  candidate AML state on copies and commits only the selected candidate.
+  Sentences cannot terminate before `SENT_MIN_LEN=8` generated tokens, and
+  newline / boundary-with-trailing-text BPE tokens are suppressed.
+- `Makefile` targets `train_janus_sonar`, `infer_janus_sonar`,
+  `infer_janus_sonar_chain`, `train_janus_sft`, `infer_janus_sft`,
+  `train_sonar_spa`, `test_sonar_ops`
 
 ## Sample chain-inference output
 
 Prompt: `She doesn't scream. She inventories. Every object has a name.`
-Weights: `microjanus_dual_sym_5k.bin` (default). AML physics: destiny 0.35,
+Weights: `microjanus_dual_sym_5k.bin` (default). AML physics: destiny 0.20,
 entropy_floor 0.10, resonance_ceiling 0.95, Kuramoto chambers.
 
 ```

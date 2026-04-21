@@ -1,11 +1,15 @@
 /*
- * infer_janus_sonar.c — Load Janus Sonar DUAL-WEIGHTS .bin, generate.
+ * infer_janus_sonar.c — Legacy 4-layer dual-weight inferencer.
  *
  *   make infer_janus_sonar
- *   ./infer_janus_sonar janus_sonar.bin "prompt" [max_tokens] [temp] [top_p]
+ *   ./infer_janus_sonar ../weights/microjanus_dual_sym_5k.bin "prompt" [max_tokens] [temp] [top_p]
+ *
+ * For 3M sonar_single_v2 / sonar_spa_v1 weights use infer_janus_sonar_chain,
+ * which has the 6-layer config and single→dual adapter.
  */
 #include "notorch.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
@@ -63,7 +67,9 @@ static Model* load_model(const char* path) {
     if (!loaded) { printf("cannot load %s\n", path); return NULL; }
     int expected = model_n_tensors();
     if (n_loaded != expected) {
-        printf("tensor count mismatch: got %d, expected %d\n", n_loaded, expected);
+        printf("tensor count mismatch: got %d, expected %d for legacy 4-layer dual weights\n",
+               n_loaded, expected);
+        printf("hint: use infer_janus_sonar_chain for sonar_single_v2.bin / sonar_spa_v1.bin\n");
         for (int i = 0; i < n_loaded; i++) nt_tensor_free(loaded[i]);
         free(loaded);
         return NULL;
@@ -219,7 +225,9 @@ int main(int argc, char** argv) {
     printf("\n[prompt] %s", prompt);
     fflush(stdout);
 
-    nt_seed((unsigned)time(NULL));
+    unsigned seed = (unsigned)time(NULL);
+    nt_seed(seed);
+    srand(seed);
     nt_train_mode(0);
 
     for (int s = 0; s < max_tokens; s++) {

@@ -2,6 +2,10 @@
 train_janus_sonar
 infer_janus_sonar
 infer_janus_sonar_chain
+train_janus_sft
+infer_janus_sft
+train_sonar_spa
+test_sonar_ops
 
 # weights / checkpoints (tokenizer merges stays)
 *.bin

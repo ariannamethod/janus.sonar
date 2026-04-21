@@ -331,23 +331,6 @@ void nt_tape_freeze_param(int param_idx) {
         g_tape.chuck_params[param_idx].frozen = 1;
 }
 
-// Find tape entry by tensor pointer
-static int tape_find(nt_tensor* t) {
-    if (!t) return -1;
-    for (int i = g_tape.count - 1; i >= 0; i--)
-        if (g_tape.entries[i].output && g_tape.entries[i].output->data == t->data)
-            return i;
-    return -1;
-}
-
-// Ensure tensor is on tape (record as leaf if not)
-static int tape_ensure(nt_tensor* t) {
-    if (!t || !g_tape.active) return -1;
-    int idx = tape_find(t);
-    if (idx >= 0) return idx;
-    return nt_tape_record(t, NT_OP_NONE, -1, -1, 0);
-}
-
 // Accumulate gradient into a tape entry
 static void tape_acc_grad(int idx, const float* grad, int len) {
     if (idx < 0 || idx >= g_tape.count) return;
@@ -1874,13 +1857,6 @@ int nt_nan_guard_check(nt_nan_guard* guard) {
 #include <sys/time.h>
 
 static nt_profiler g_profiler = {0};
-static long g_alloc_bytes = 0;
-
-static double now_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
-}
 
 void nt_profiler_enable(void)  { g_profiler.enabled = 1; }
 void nt_profiler_disable(void) { g_profiler.enabled = 0; }

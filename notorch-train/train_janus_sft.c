@@ -310,6 +310,7 @@ int main(int argc, char** argv) {
     printf("corpus: %.1f KB → %d BPE tokens\n", fsize/1024.0, n_tokens);
 
     nt_seed(42);
+    srand(42);
     Model* m = (Model*)calloc(1, sizeof(Model));
     if (load_base(m, wpath) < 0) { free(m); return 1; }
     init_adapters(m);
