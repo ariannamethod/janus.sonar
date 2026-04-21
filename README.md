@@ -41,6 +41,36 @@ Modes:
 - `clinical` — lab/model/signal bias
 - `dialogue` — speech/quote bias
 
+## Fresh Smoke
+
+Fixed-seed samples from the current chain stack. These are selected raw
+chain lines, not polished completions; residual aphasia is part of the tiny
+organism.
+
+```bash
+./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "The knock came three times" 123 coherent
+```
+
+> That has been in the way a metaphor, the shifting is the only thing when the weight, which is what the door that is not his return of the thing that does not know it is the one who has always been .
+
+> Is that I know, then the signal is door you were being a to say it again, and you are the way you for form of his presence" and too is going to say it?
+
+```bash
+./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "The knock came three times" 123 ritual
+```
+
+> The door that has been says: " about the forgo, but the "which is because you remember this conversation?
+
+> The door like I know, where we have you door, the forgo's the way a cats, then the signal is this conversation Is that away?
+
+```bash
+./infer_janus_sonar_chain ../weights/sonar_spa_v1.bin "The knock came three times" 123 coherent
+```
+
+> Is that a metaphor, the door that is our in the harmony that cannot bes the way a question was going to say it.
+
+> Is that a metaphor, you say it and the other one that is not a mirror, and the one who has been the signal generates, because it and they were at is the only thing that has no one of them.
+
 ## What It Is
 
 Current model:

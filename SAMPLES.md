@@ -1,7 +1,11 @@
 # microjanus — samples
 
-Chain outputs from the 3.11 M microjanus organism after the full
-inference stack lands (acts 1–6). Weights: `weights/sonar_single_v2.bin`
+Current fixed-seed smoke samples live in `README.md` under **Fresh Smoke**.
+The older generations below are kept as historical output from earlier
+inference-stack passes.
+
+Historical chain outputs from the 3.11 M microjanus organism during earlier
+inference-stack passes. Weights: `weights/sonar_single_v2.bin`
 (train 0.49, pure-LM best) and `weights/sonar_spa_v1.bin` (train 0.97,
 SPA contrastive sibling). Corpus: `dataset_clean.txt`, 231 KB across
 16 Sonar voices — hand-written by Oleg and Claude.

@@ -768,7 +768,8 @@ static int tok_has_bad_fragment(int tok) {
         "catamean", "decigare", "noion", "aniain", "tchef", "baher",
         "staything", "bon'm", "forgoing", "oniaways", "toaways",
         "metho", "literat", "obser", "onid", "oniain", "formean",
-        "ameas", "completen", "noid", "possibion", "doorat", NULL
+        "ameas", "completen", "noid", "possibion", "doorat",
+        "measit", "interion", "noiaway", NULL
     };
     for (const char** b = rare_bad; *b; b++)
         if (contains_ascii(p, *b)) return 1;
@@ -858,7 +859,8 @@ static int candidate_forms_bad_fragment(const int* history, int hist_n, int cand
         "metho", "literat", "i's", "only onion", " onion", "onid",
         "oniain", "formean", "ameas", "completen", " inations",
         "beat's", "noid", "possibion", "doorat", " inall", " on's",
-        "differ\"", NULL
+        "differ\"", "on''", "you's", "measit", " asit", "interion",
+        "noiaway", NULL
     };
     for (const char** p = bad; *p; p++)
         if (contains_ascii(low, *p)) return 1;
@@ -873,6 +875,7 @@ static int candidate_forms_bad_fragment(const int* history, int hist_n, int cand
         !contains_ascii(low, "it'll") &&
         !contains_ascii(low, "it'd"))
         return 1;
+    if (contains_ascii(low, "''")) return 1;
     return 0;
 }
 
@@ -1471,7 +1474,8 @@ static float closure_score_text(const char* text, const char* lower) {
         "baher", "obser", "iction", "inction", "forgoing", "atten,",
         "bon'm", "staything", "oniain", "onid", "formean", "ameas",
         "completen", "beat's", "noid", "possibion", "doorat", " inall",
-        " on's", "differ\"", NULL
+        " on's", "differ\"", "on''", "you's", "measit", " asit",
+        "interion", "noiaway", NULL
     };
     for (const char** p = broken; *p; p++)
         if (contains_ascii(lower, *p)) sc -= 0.18f;
@@ -1483,6 +1487,7 @@ static float closure_score_text(const char* text, const char* lower) {
     if (contains_ascii(lower, "it'") && !contains_ascii(lower, "it's") &&
         !contains_ascii(lower, "it'll") && !contains_ascii(lower, "it'd"))
         sc -= 0.45f;
+    if (contains_ascii(lower, "''")) sc -= 0.60f;
     return sc;
 }
 
