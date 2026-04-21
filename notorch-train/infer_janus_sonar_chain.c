@@ -725,6 +725,14 @@ static int tok_starts_alpha(int tok) {
     unsigned char c = g_bpe->tokens[tok][0];
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
+static int tok_ends_apos(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    int len = g_bpe->token_len[tok]; if (len == 0) return 0;
+    return g_bpe->tokens[tok][len-1] == '\'';
+}
+static int tok_ends_alpha_or_apos(int tok) {
+    return tok_ends_alpha(tok) || tok_ends_apos(tok);
+}
 
 /* ── neoleo-ported orphan + capital-glue filters ── */
 
@@ -785,10 +793,11 @@ static int is_orphan_fragment_bpe(int id) {
     return 1;
 }
 
-/* Capital glue: prev token ends alpha + cand starts uppercase alpha →
-   guaranteed cross-sentence token-glue ("catalo" + "He" → "cataloHe"). */
+/* Capital glue: prev ends alpha OR apostrophe + cand starts uppercase alpha
+   → cross-word/sentence token-glue ("catalo"+"He" → "cataloHe";
+    "I'"+"The" → "I'The"). */
 static int is_capital_glue_bpe(int prev_tok, int cand_id) {
-    if (!tok_ends_alpha(prev_tok)) return 0;
+    if (!tok_ends_alpha_or_apos(prev_tok)) return 0;
     if (!g_bpe || cand_id < 0 || cand_id >= g_bpe->vocab_size) return 0;
     if (g_bpe->token_len[cand_id] == 0) return 0;
     unsigned char c = g_bpe->tokens[cand_id][0];
@@ -815,7 +824,9 @@ static int find_space_token(void) {
 static int sample(float* logits, int n, float temp, float top_p,
                   const AMLField* field, float* field_out,
                   const int* history, int hist_n, int gen_step) {
-    if (history && hist_n > 0) apply_rep_penalty(logits, history, hist_n);
+    /* apply_rep_penalty is now folded into the Dario-field block as the
+       Q-style age-based scheme; keep the older flat 64-token pass off. */
+    (void)apply_rep_penalty;
     if (field) aml_apply_field(logits, n, field);
 
     /* ── Dario field (Q/postgpt-q style): θ = ε + γ —
@@ -825,31 +836,53 @@ static int sample(float* logits, int n, float temp, float top_p,
     if (g_mw_ready && history && hist_n > 0) {
         int prev  = history[hist_n - 1];
         int prev2 = hist_n >= 2 ? history[hist_n - 2] : -1;
-        int prev_alpha = tok_ends_alpha(prev);
+        int prev_alpha_apos = tok_ends_alpha_or_apos(prev);
         float hebb[VOCAB];
         mw_hebb_query(history, hist_n, hebb, n);
         for (int i = 0; i < n; i++) {
-            /* Bigram & trigram: raw probabilities as additive logit boost */
             float bg = (prev >= 0 && prev < VOCAB) ? g_mw_bigram[prev][i] : 0;
             float tg = (prev2 >= 0) ? mw_trigram(prev2, prev, i) : 0;
             logits[i] += MW_BIGRAM_W * bg + MW_TRIGRAM_W * tg + MW_HEBB_W * hebb[i];
-            /* Unigram floor: tokens the corpus never sees get hard-pushed down.
-               Strips out the majority of random-BPE salad. */
-            if (g_mw_unigram[i] < MW_UNIGRAM_FLOOR) logits[i] += MW_UNI_FLOOR_PEN;
-            /* Word-gate (soft): mid-word orphan where no bigram backs it up */
-            if (prev_alpha && tok_starts_alpha(i) && bg < 1e-6f && tg < 1e-6f)
-                logits[i] += MW_WORD_GATE;
+            /* Hard unigram cut: BPE merges file is legacy — includes tokens
+               the Sonar corpus never contained. These are noise by
+               definition. Kill absolutely. */
+            if (g_mw_unigram[i] < MW_UNIGRAM_FLOOR) logits[i] = -1e9f;
+            /* Hard word-gate: prev ends alpha-or-apos + cand starts alpha +
+               the corpus never saw this pair bigram-wise or in trigram
+               context → guaranteed salad glue. */
+            if (prev_alpha_apos && tok_starts_alpha(i) && bg < 1e-6f && tg < 1e-6f)
+                logits[i] = -1e9f;
+            /* Digit-glue: prev ends alpha + cand starts digit → "differ192"
+               class. Corpus uses digits very sparingly, usually after space
+               or punctuation — almost never immediately after a word. */
+            if (prev_alpha_apos && g_bpe && g_bpe->token_len[i] > 0) {
+                unsigned char c0 = g_bpe->tokens[i][0];
+                if (c0 >= '0' && c0 <= '9') logits[i] = -1e9f;
+            }
         }
     }
 
-    /* Bigram blocking (Q-style anti-repetition on pairs): for every past
-       occurrence history[i]==prev, dampen the token that followed it. */
-    if (history && hist_n >= 2) {
+    /* Bigram blocking — Q-style (0.2×); tightened to 0.1× to suppress
+       "differ"-class lexical loops. Also apply age-based token repetition
+       penalty in a 20-token window: recent = 0.335×, old = 0.65× (replaces
+       the older flat 0.65 across 64 tokens). */
+    if (history && hist_n >= 1) {
         int prev = history[hist_n - 1];
         for (int i = 0; i < hist_n - 1; i++) {
             if (history[i] == prev) {
                 int blocked = history[i + 1];
-                if (blocked >= 0 && blocked < n) logits[blocked] *= 0.2f;
+                if (blocked >= 0 && blocked < n) logits[blocked] *= 0.1f;
+            }
+        }
+        int lo = hist_n - 20; if (lo < 0) lo = 0;
+        for (int i = lo; i < hist_n; i++) {
+            int tok = history[i];
+            if (tok >= 0 && tok < n) {
+                float age = (float)(hist_n - i);
+                float pen = 0.3f + 0.035f * age;
+                if (pen > 1.0f) pen = 1.0f;
+                if (logits[tok] > 0) logits[tok] *= pen;
+                else                 logits[tok] *= (2.0f - pen);
             }
         }
     }
