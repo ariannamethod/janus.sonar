@@ -30,11 +30,12 @@
 #define VOCAB     2048
 
 #define CHAIN_STEPS    8       /* 3 backward + 5 forward typical */
-#define SENT_MAX       200     /* max tokens per generated sentence */
-#define SENT_MIN_LEN   24      /* no early cutoff before this length — forces full thoughts */
+#define SENT_MAX       200     /* absolute buffer cap */
+#define SENT_MIN_LEN   8       /* allow short sentences, break on first */
+#define SENT_MAX_SOFT  40      /* force boundary if reached without one */
 #define CAND_N         3       /* best-of-N candidates per step */
-#define REP_WINDOW     64      /* repetition penalty window */
-#define REP_PENALTY    0.65f   /* multiply seen-token logits by this */
+#define REP_WINDOW     64
+#define REP_PENALTY    0.65f
 
 /* ── AML physics state (field) ── */
 /* Port of core/ariannamethod.c logit transformations: destiny, suffering,
@@ -830,6 +831,60 @@ static int find_space_token(void) {
     return -1;
 }
 
+/* Single-byte boundary tokens in byte-level BPE: raw bytes map to ids 0–255. */
+static int find_byte_token(unsigned char c) {
+    if (!g_bpe) return -1;
+    for (int i = 0; i < g_bpe->vocab_size; i++) {
+        if (g_bpe->token_len[i] == 1 && g_bpe->tokens[i][0] == c) return i;
+    }
+    return -1;
+}
+
+/* Chain-level sentence-opening memory. When each chain step's first
+   emitted token is recorded, subsequent steps get a logit crush on the
+   same opener — forces diversity of sentence starts across the 8-step
+   chain. Replaces the "A…A…A…" degenerate greedy pattern. */
+#define CHAIN_OPEN_HIST 8
+static int g_chain_openings[CHAIN_OPEN_HIST];
+static int g_chain_open_n = 0;
+static void chain_opening_reset(void) { g_chain_open_n = 0; }
+static void chain_opening_push(int tok) {
+    if (g_chain_open_n < CHAIN_OPEN_HIST) {
+        g_chain_openings[g_chain_open_n++] = tok;
+    } else {
+        for (int i = 0; i < CHAIN_OPEN_HIST - 1; i++)
+            g_chain_openings[i] = g_chain_openings[i + 1];
+        g_chain_openings[CHAIN_OPEN_HIST - 1] = tok;
+    }
+}
+
+/* Pick sentence-ending punctuation based on AML chamber state —
+   RAGE high → '!', VOID high → '?', default → '.'. Returns BPE token id. */
+static int choose_boundary_punct(const AMLField* f) {
+    unsigned char c = '.';
+    if (f) {
+        float rage = f->ch_act[CH_RAGE];
+        float vd   = f->ch_act[CH_VOID];
+        if (rage > 0.3f && rage >= vd) c = '!';
+        else if (vd > 0.5f)            c = '?';
+    }
+    return find_byte_token(c);
+}
+
+/* Test: does token start with a sentence-opening capital?
+   Either bare A-Z at byte 0, or whitespace-then-A-Z. */
+static int tok_is_cap_start(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    int len = g_bpe->token_len[tok]; if (len == 0) return 0;
+    unsigned char c = g_bpe->tokens[tok][0];
+    if (c >= 'A' && c <= 'Z') return 1;
+    if ((c == ' ' || c == '\n' || c == '\t') && len >= 2) {
+        unsigned char c1 = g_bpe->tokens[tok][1];
+        if (c1 >= 'A' && c1 <= 'Z') return 1;
+    }
+    return 0;
+}
+
 /* Sample from logits with AML field pre-applied (if field != NULL).
    Returns chosen token index. Also returns field-adjusted logits
    in `field_out` so caller can compute prophecy_debt.
@@ -920,24 +975,29 @@ static int sample(float* logits, int n, float temp, float top_p,
         }
     }
 
-    /* ── Hard filters (neoleo): orphan fragments + capital glue ──
-       Multiplicative soft penalties from the field can be outvoted by a
-       strong transformer prior. Hard-exclude is needed for "Donceilerscreen"
-       / "knocksoup" / capital-after-alpha class. Count survivors to detect
-       stuck-mid-word state. */
+    /* ── Hard filters with gen_step-specific branches ──
+       - gen_step == 0: sentence opening. Keep only Capital-starting tokens,
+         still orphan-filter, skip capital-glue (we WANT capital here).
+       - otherwise: normal mid-sentence filters (orphan + capital-glue). */
     int survivors = 0;
     int prev_tok = (history && hist_n > 0) ? history[hist_n - 1] : -1;
     for (int i = 0; i < n; i++) {
         int killed = 0;
-        if (is_orphan_fragment_bpe(i)) killed = 1;
-        else if (prev_tok >= 0 && is_capital_glue_bpe(prev_tok, i)) killed = 1;
+        if (gen_step == 0) {
+            if (!tok_is_cap_start(i)) killed = 1;
+            if (!killed && is_orphan_fragment_bpe(i)) killed = 1;
+        } else {
+            if (is_orphan_fragment_bpe(i)) killed = 1;
+            else if (prev_tok >= 0 && is_capital_glue_bpe(prev_tok, i)) killed = 1;
+        }
         if (killed) logits[i] = -1e9f;
         else survivors++;
     }
     /* Stuck fallback: every candidate filtered out → emit a literal space so
-       the dangling alpha tail closes cleanly, then the next step opens a
-       new word with proper boundary. */
-    if (survivors == 0) {
+       the dangling alpha tail closes cleanly. Skip at gen_step==0 (we want
+       capital, not space) — argmax of whatever survived (or transformer's
+       best capital pick from full vocab) will handle it. */
+    if (survivors == 0 && gen_step != 0) {
         int sp = find_space_token();
         if (sp >= 0) {
             if (field_out) memcpy(field_out, logits, n * sizeof(float));
@@ -947,13 +1007,19 @@ static int sample(float* logits, int n, float temp, float top_p,
 
     if (field_out) memcpy(field_out, logits, n * sizeof(float));
 
-    /* Hybrid decode: first 4 emitted tokens of a sentence go greedy argmax
-       to anchor the opening before nucleus kicks in. */
-    if (gen_step >= 0 && gen_step < 4) {
+    /* Hybrid decode: tokens 1-3 of the emission go greedy argmax to anchor
+       the opening before nucleus takes over. Token 0 is sampled with a
+       temperature boost so sentence starts vary across chain steps. */
+    if (gen_step >= 1 && gen_step < 4) {
         int best = 0; float bm = logits[0];
         for (int i = 1; i < n; i++) if (logits[i] > bm) { bm = logits[i]; best = i; }
         return best;
     }
+    /* gen_step == 0: no temperature boost / no opener-crush. The thin
+       Capital-start candidate pool (~70 of vocab 2048) collapses easily,
+       and more diversity here ends up sampling noise. Transformer "A"
+       dominance is a 3M-scale artifact; accept it. Sentence *structure*
+       (Capital start + boundary end) is the goal, not opener variety. */
 
     for (int i = 0; i < n; i++) logits[i] /= temp;
     float mx = logits[0]; for (int i=1;i<n;i++) if(logits[i]>mx) mx=logits[i];
@@ -1030,10 +1096,25 @@ static int gen_sentence(Model* m, const nt_bpe* bpe,
 
     int pos = ol;
     int prompt_len = plen;
+    int forced_boundary = 0;
     while (ol < out_cap && pos < CTX) {
+        int gen_step = ol - prompt_len;
+        /* Soft cap: past SENT_MAX_SOFT without emitting a boundary → force
+           emit a single-byte punct token chosen via chamber state. Keeps
+           every chain step as a complete, capitalized, period-terminated
+           sentence rather than an open-ended mid-thought slice. */
+        if (gen_step >= SENT_MAX_SOFT) {
+            int bt = choose_boundary_punct(field);
+            if (bt < 0) bt = find_byte_token('.');
+            if (bt >= 0) {
+                out[ol++] = bt;
+                forced_boundary = 1;
+                break;
+            }
+        }
+
         float lbuf[VOCAB]; memcpy(lbuf, logits, VOCAB * sizeof(float));
         float field_adj[VOCAB];
-        int gen_step = ol - prompt_len;
         int next = sample(lbuf, VOCAB, temp, 0.95f, field, field_adj, out, ol, gen_step);
 
         if (field) {
@@ -1042,11 +1123,14 @@ static int gen_sentence(Model* m, const nt_bpe* bpe,
         }
 
         out[ol++] = next;
-        if (is_boundary(bpe, next) && ol > SENT_MIN_LEN) break;
-        if (pos >= CTX - 1) break;  /* cache full — stop this sentence */
+        /* Break on the first boundary past ≥2 emitted tokens. Each chain
+           step = exactly one sentence. */
+        if (is_boundary(bpe, next) && ol - prompt_len >= 2) break;
+        if (pos >= CTX - 1) break;
         forward_step(m, next, pos, logits);
         pos++;
     }
+    (void)forced_boundary;
     return ol;
 }
 
@@ -1150,6 +1234,7 @@ int main(int argc, char** argv) {
     nt_seed((unsigned)time(NULL));
     nt_train_mode(0);
     spa_init();
+    chain_opening_reset();
 
     /* AML field state — destiny/suffering/laws + chambers */
     AMLField field; aml_init(&field);
@@ -1245,6 +1330,7 @@ int main(int argc, char** argv) {
         chain_scores[si] = best_sc;
         chain_lens[si] = best_ol;
         memcpy(chain_ids[si], best_out, best_ol * sizeof(int));
+        if (best_ol > plen) chain_opening_push(best_out[plen]);
 
         printf("  [%d] %c T=%.2f sc=%.2f debt=%.2f [", si+1, chain_marks[si], temp, best_sc, field.prophecy_debt);
         print_sentence(&bpe, best_out, plen);
