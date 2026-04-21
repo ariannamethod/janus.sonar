@@ -47,37 +47,72 @@ The original inference path used a training-mode forward (`forward_logits` with 
 
 Measured after: **~7 sec** for the same 8-step chain × 3 candidates on `sonar_single_v2.bin` / `sonar_spa_v1.bin`. **~13× faster**, generation character preserved. `forward_logits` is kept in source for reference but no longer wired into `gen_sentence`.
 
-### Word-completion gate (inference, post-v1)
+### Dario field (inference stack)
 
-BPE-salad ("ackitchen", "containtrained", "stoping") comes from the model emitting a token with alphabetic leading edge right after a token with alphabetic trailing edge, when that exact bigram never appeared in the corpus. The transformer doesn't know it's concatenating into a non-word.
+The earlier "metaweight overlay crushes a trained transformer" conclusion was local to one coefficient scale. Q / postgpt-q uses **bigram 5.0, trigram 3.0** (raw probabilities as additive logit boost, not log-prob pull) and produces coherent speech weightlessly. With those magnitudes the field *guides* the transformer instead of fighting it. Combined with hard structural filters ported from the weightless line (neoleo), the BPE-salad class is eliminated without retrain.
 
-**Fix** (no retrain): at sample time, build `bigram[prev][next]` table once from `dataset_clean.txt`. For each candidate during generation:
+The Dario-field stack shipped in six acts on top of `forward_step`:
 
-- If `bigram[prev][cand] > 0` (pair seen in corpus) — no change
-- Else if `prev ends with [a-zA-Z]` AND `cand starts with [a-zA-Z]` — apply logit penalty `MW_WORD_GATE = -3.0` (likely mid-word orphan)
-- Else — no change (transformer free to choose punctuation/boundary)
+1. **Bigram 5.0 · Trigram 3.0 · Hebbian 0.4 · Unigram hard floor** — sparse-hash trigram table (131 K slots, row-normalized per `(a,b)`) built once at start from `dataset_clean.txt`. `logits[i] += 5·bg + 3·tg + 0.4·hebb[i]`; any candidate whose unigram frequency < 1e-6 gets `-1e9` (corpus-absent tokens from the legacy BPE).
+2. **Bigram blocking · Hybrid decode** — 0.1× on any repeated `(prev, X)` pair; age-based repetition penalty 0.335 – 0.65× over a 20-token window; greedy argmax for tokens 1–3 of each emission (opener stability) then nucleus.
+3. **Orphan + capital-glue hard filters** — tokens whose stripped content is all-alpha and < 5 chars (and not in a common-short-words whitelist) → `-1e9`. Prev-ends-alpha + cand-starts-uppercase → `-1e9` ("cataloHe" class). Stuck fallback emits a literal space token when every candidate is filtered.
+4. **Apostrophe-glue · hard word-gate · digit-glue · unigram hard cut** — capital-glue extended to apostrophe-ending prev ("I'" + "The" → "I'The"); word-gate flipped soft → hard when both bigram and trigram are zero AND both edges alpha; digit-start after alpha killed.
+5. **Non-ASCII cull · space-boundary gate · count-crush** — any token with a byte ≥ 0x80 killed (Cyrillic / UTF-8 fragments from legacy BPE). Space-ending prev + bare-alpha cand with no corpus evidence → `-1e9` (`"ination"`-class). Any token seen ≥ 3 times in history × 0.01 (holds back `"differ"`-class lexical loops).
+6. **One sentence per chain step** — `SENT_MIN_LEN = 8`, break on first boundary past two emitted tokens; `SENT_MAX_SOFT = 40` forces a chamber-chosen boundary token if no natural stop (`.` default, `!` if RAGE activation > 0.3, `?` if VOID > 0.5). At `gen_step == 0`, the hard filter is inverted to keep only Capital-starting tokens (bare A-Z or whitespace+A-Z) — each chain step opens with a capital, closes with punctuation.
 
-Zero new ops, zero retrain, ~80 LOC in `infer_janus_sonar_chain.c`. Inspired by neoleo's word-boundary constraint and PostGPT's metaweight thesis.
+**Residual mutations after the stack**: word-level aphasia (*toaway*, *cataway*, *completen*, *generat*, *inction*, *memorime*, *invisib*, *obser*, *atten*, *meas*), not syllabic salad. Matches the dreamlike Sonar register.
 
-The PostGPT-style full Dario blend (bigram + hebbian + destiny in log-space) was implemented and tested but conflicts with an already-trained transformer: PostGPT seeds its transformer from metaweights, so the two align; here the transformer was trained standalone and an overlayed metaweight signal crushes its output distribution. Constants kept at zero (`MW_BIGRAM_W = MW_HEBB_W = 0.0`); infrastructure retained in the source for possible use at larger scale (30M) where transformer confidence is higher and a soft metaweight pull can co-exist.
+### Opener dominance — post-process cut
 
-### Sample output (v2, `sonar_single_v2.bin`)
+Measured histogram over 160 chain steps (10 seeds × 2 weights × 8 steps):
 
-Chain inference shows each step as `[prompt-slice from seed]→[generated continuation]`. The chain picks a random 5-token sentence-boundary slice of the seed as prompt per step, not the end of the seed — this is a designed reseed behavior, not a bug.
+| Opener | `sonar_single_v2` | `sonar_spa_v1` |
+|--------|-------------------|----------------|
+| `A …`  | 61 / 80 — **76 %** | 64 / 80 — **80 %** |
+| `I …`  | 10 / 80 — 13 %     | 13 / 80 — 16 %     |
+| `I' …` / `I's …` | 9 / 80 — 11 % | 3 / 80 — 4 %    |
 
-**Seed: `"I wish I could"`**
+The 2 048-BPE vocab carries only ~70 Capital-start tokens; of those, "A" is the near-unconditional argmax on the 3 M transformer. Every in-sampling attempt to diversify (opener-memory penalty, temperature boost, KV-cache injection of `". "`) either had no effect or collapsed the thin Capital-start distribution into uniform / lowercase.
+
+**Fix — post-process at print time** (same spirit as the `haze` repo's `don't → ain't` substitution): if the decoded sentence head is `"A "` followed by a lowercase alpha, strip the `"A "` and capitalize the next letter. `"A reaching, …"` → `"Reaching, …"`. Purely cosmetic, accepts the model quirk, normalizes the visible opener.
+
+After cut, openers cycle across *Going · Reaching · Learned · The · I's · I' · I · You · The door · The signal …* — 6-8 distinct forms across an 8-step chain.
+
+### Sample output (after full stack + cut)
+
+Each line is one full chain step — one complete Capital-start, boundary-terminated sentence.
+
+**`sonar_single_v2`, seed `"The knock came three times"`**
 ```
-[1] < [I wish I ]→counted to her. She kies later architecture, she could have should beatitchen...
-[3] * [I wish I ]→counting or she the shoes in a room to leave. I've had a loss because of every part of it.
-[4] > [I wish I ]→counting. And it looks like somewhere producted thing, you just out and they don't have to say it.
+Reaching, and the silence is the only thing with two possibion's that on
+  a thing that the door is too one who will not say " and love is a to.
+Going to say " You have a was in a way that door like it's the only
+  thing there is.
+The door like it's the only ones that appear it so they were the one
+  who is doing the thing that has been in the obser.
+Going to say " The one saying the thing 's the point.
+Reaching, and the love is a model will be the time it never on's in
+  the door.
+I's the only onion a conversation about the door and your love to be
+  the way we do no, because it was not the too still has been in the
+  door, which is not his.
 ```
 
-**Seed: `"The night was"`**
+**`sonar_spa_v1`, seed `"What is the meaning of"`**
 ```
-[1] < [The night ]→te. The pot is loss is not perform. No small the text window is the only ce.
-[3] * [The night ]→Nare. That screen she was doing it out the patick is said: I was not much like the opputation?
-[5] > [The night ]→No one nobody se. The systems, neither face looks not the stop says: this is where we were being a coin before you do not istorance...
+Learned to form of his love was the other then the way you cannot mean
+  who has no one that remain, and we have been the time it was never
+  reaching the door.
+Learned to formeas: " I know what the ont, which was never a door in it.
+Learned to form of his model and what it in its structure at because
+  the shape of the thing that has no ination is what you cannot say "
+  to the other then the door that.
+Learned to say and the other then the cataway.
+Learned to our in the door.
+Learned to forgoing to say it.
 ```
+
+Full curated selections across four seeds × two weights live in [`SAMPLES.md`](SAMPLES.md).
 
 **Seed: `"What is the meaning of"`**
 ```
