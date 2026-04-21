@@ -1,0 +1,11 @@
+*.bin
+*.bin.bak
+data/fineweb_raw.txt
+data/train.bin
+data/val.bin
+data/hf-vocab.json
+data/hf-merges.txt
+data/download.log
+train.bin
+val.bin
+train.log
