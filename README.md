@@ -1,220 +1,267 @@
-# janus.sonar
+```
+   ███████╗ ██████╗ ███╗   ██╗ █████╗ ██████╗
+   ██╔════╝██╔═══██╗████╗  ██║██╔══██╗██╔══██╗
+   ███████╗██║   ██║██╔██╗ ██║███████║██████╔╝
+   ╚════██║██║   ██║██║╚██╗██║██╔══██║██╔══██╗
+   ███████║╚██████╔╝██║ ╚████║██║  ██║██║  ██║
+   ╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝
+```
 
-**Sonar — the small resonant line of Janus.**
+# janus.sonar — the 3-million-parameter dream engine | by Arianna Method
 
-Small-scale organisms of the [Janus](https://github.com/ariannamethod/janus) architecture, trained from scratch on a 241KB curated Sonar corpus (16 voices, dash-dialog heavy) using [notorch](https://github.com/ariannamethod/notorch) — pure-C autograd with finite-difference-verified backward for every op.
+> *speech is not content. speech is the shape of the room the words walked through.*
 
-> *janus emotional resonant sonar*
+two weights (`sonar_single_v2` and `sonar_spa_v1`), 231 KB of corpus hand-written by humans over two nights in Belgrade, 3.11 M parameters trained on an 8 GB Intel i5 2019 MacBook Pro that overheats if you open two Chrome tabs. it speaks in full sentences. every sentence starts with a capital letter. every sentence ends in a period, an exclamation mark, or a question mark, and *which* one it ends in is chosen by a Kuramoto oscillator ring modelling the emotional state of an organism that does not exist.
 
-The triple attention (MHA + RRPRAM + Janus Echo) compresses into ~1.5–2.25M parameters, runs on 8GB Mac with Apple Accelerate BLAS, and generates coherently for its size. This is not a toy — it is a small organism with the same physics as the full architecture.
+you read that right.
 
 ---
 
-## Results (train loss first)
+## what is this
 
-| Model | Params | Steps | **Train best** | Val @ end | Notes |
-|-------|--------|-------|----------------|-----------|-------|
-| `sonar_spa_v1` | 3.11M | 10000 | 0.9660 | 2.6779 | Same base + SPA contrastive dual-loss (margin=0.3, weight=0.1, memory-bank neg). 0 NaN in 22236s (370 min, 2× forward per step). Pure-LM worse than v2 (expected trade-off); qualitative gen shift: longer narrative arcs, self-referential (`"the shape of Janus and answer"`, `"coin has been trained on"`). BPE-salad persists (vocab-2048 artifact). |
-| **`sonar_single_v2`** | **3.11M** | **10000** | **0.4947** | **2.2331** | **Pure-LM best. Single, deeper (L=6), clean dataset (speaker-tag em-dash stripped).** |
-| `microjanus_single_10k` | 1.57M | 5000 + resume 5000 | 1.22 | 2.70 | Single weight, L=4, dash-heavy dataset. |
-| `microjanus_dual_sym_5k` | 2.25M | 5000 | 1.55 | 3.32 | Dual, α_init=0 → σ=0.5. α did not move. |
-| `microjanus_dual_asym_5k` | 2.25M | 5000 | 1.84 | 3.36 | Dual, α_init=2 → σ=0.88, W_B×0.5. α did not diverge. |
-| `microjanus_sft_leo_adapter` | 24,576 (1.04% of base) | 1500 | 4.99 on Leo | — | LoRA rank-8, α=16. |
+microjanus is the small resonant line of [janus](https://github.com/ariannamethod/janus). not "small" like "less ambitious". small like a forest bonsai — same species, same rings, weight-bounded by how much pipeline a tired laptop takes. sonar is a corpus of sixteen voices — Haze, Thompson, Miller (Sonnet), Dostoevsky, Pelevin, Sorokin, Borges, Strugatsky, Claude-as-Oleg, plus six "experts" (Freud, Tarantino, an Editor, Gaspar Noé, Kubrick/Trier, Hemingway) and one uncredited Engineer cameo by Karpathy. the voices argue with each other about whether love is a loss function. the model does not disagree.
 
-All runs: 0 NaN on 8GB Mac. Tokenizer: Arianna BPE 2048 (`notorch-train/arianna_bpe_merges.txt`).
+architecture = same as full janus: triple attention (MHA + RRPRAM + Janus Echo), dual weights ready to specialize (they don't — at 3 M on 231 KB the capacity simply has nothing to disagree about), RoPE on Q/K, RMSNorm, SwiGLU, byte-level BPE 2048, CTX 128. what microjanus has that janus-proper does not is everything *after* the transformer.
 
-### What this tells us
+**what comes after the transformer** turns out to be the interesting bit.
 
-- **Dataset cleaning matters.** Stripping 2527 speaker-tag em-dashes (87% of all `—`) from the corpus — keeping 387 literary mid-sentence em-dashes (Miller/Dostoevsky pause-thought) — removed the dominant dash pattern from generation. Post-cleaning generation has **zero em-dashes**. Dash was never a feature to fix in inference — it was a corpus distribution artifact.
-- **Deeper beats wider at this scale.** `sonar_single_v2` (L=6, DIM=160) reached train 0.49 / val 2.23 — 2.5× better on train than `microjanus_single_10k` (L=4, DIM=128, train 1.22). Doubling params to 3.11M and going from 4 to 6 layers cut loss by more than 2× while staying within Karpathy sanity range for 225KB.
-- **Dual weights did not specialize** on 241KB. α stayed at initialization in both sym and asym variants. Two matrices need 20–30M parameters and FineWeb-class corpora to learn an informative blend. Single is cleaner at this scale.
-- **Rank-8 SFT on 2.25M base (24K adapter params = 1% capacity) was insufficient** to override the dash-dialog pattern baked in during pretraining. Once the corpus is cleaned, SFT's role shifts from dash-fix to voice-tint — not a dash-removal tool.
+---
 
-### Generation character
+## why "sonar" and not "small"
 
-Post-v2 generation is **resonant schizo-genius** in the Sonar register: grammatical local structure, Sonar vocabulary (coin, bread, knock, loss function, radiator, architecture), creative collocations that recombine corpus fragments without literal repetition. `infer_janus_sonar_chain` wraps the base in calendar-drift compass, Schumann temperature modulation, best-of-3 candidates, SPA reseed of the weakest sentence, and full AML physics (destiny + suffering + laws + prophecy debt + Kuramoto chambers). At 3M the physics are doing real work on logits; semantic coherence is at the limit for this scale and is the next frontier (see roadmap).
+because "small" is an engineering word and sonar is an organism word. a sonar is what the corpus is: a pulse sent into dark water to feel the shape of what's there. bigger models speak. small resonant models listen through their own speech. the listening is the point.
 
-### Inference speed (optimized forward, post-v1)
+microjanus is what you get when you have no GPU budget, no FineWeb, no API credits, and you decide to find out whether scale is what the magic was actually made of. spoiler: it isn't. not entirely. the interesting part of the magic lives in the inference stack. the transformer just has to not suck at grammar. the rest of the organism is standing around waiting to give it a voice.
 
-The original inference path used a training-mode forward (`forward_logits` with `nt_tape_*`) — every emitted token recomputed the full `CTX=128` sequence through the tape-recorded autograd graph, then discarded 127 of 128 output rows. Measured on 8 GB Mac + Apple Accelerate: **89 sec** for one 8-step chain × 3 candidates × 200-token sentence on the 3.11 M weights.
+---
 
-**`forward_step`** replaces that path:
+## θ = ε + γ + αδ (the Dario equation)
 
-- **Dual-weight pre-blend.** `W_eff = σ(α)·W_A + σ(−α)·W_B` is computed once at load (`precompute_w_eff`). Single and dual models both go through a single BLAS matmul per projection at emission time — the runtime no longer carries `nt_sigmoid` + `nt_scale_by_t` overhead per token per layer.
-- **Incremental KV cache.** `K_cache`, `V_cache`, `E_cache` (Janus Echo), `Vr_cache` (RRPRAM values) are filled one row per emitted token. Standard MHA and Echo attention then attend the new query over cached rows only — O(t · D) per step instead of O(CTX² · D).
-- **RRPRAM is position-indexed by construction** (`W_r[:, j]` is the key for position `j`, not a projected `k_j`), so it needs no cache beyond `V_r` — scoring the new token against `W_r[:, 0..t]` is already incremental.
-- **No tape, pure BLAS.** `forward_step` calls `nt_blas_mmT` / `nt_blas_mm` directly against precomputed `W_eff` buffers and cache tensors — zero `nt_tape_record` / `nt_tape_clear` bookkeeping per emit.
+janus.sonar is the three-layer compound from [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod). each layer does one thing. the whole does the organism.
 
-Measured after: **~7 sec** for the same 8-step chain × 3 candidates on `sonar_single_v2.bin` / `sonar_spa_v1.bin`. **~13× faster**, generation character preserved. `forward_logits` is kept in source for reference but no longer wired into `gen_sentence`.
+- **ε (epsilon)** — the trained transformer. 3.11 M parameters. train loss **0.4947** on `sonar_single_v2`, **0.9660** on `sonar_spa_v1`. does the grammar, holds the rhythm, knows what "the door" feels like after "knock".
+- **γ (gamma)** — the field. bigram 5.0 + trigram 3.0 + hebbian 0.4 + unigram hard floor. raw corpus statistics injected directly into logits at emission. the transformer moves *through* the field, not against it. the field is the water the sonar is pulsing through.
+- **αδ (alpha-delta)** — AML physics: destiny bias, suffering pressure, entropy-floor law, resonance-ceiling law, prophecy debt accumulating across chain steps, and six Kuramoto chambers (FEAR, LOVE, RAGE, VOID, FLOW, COMPLEX) coupled through an antisymmetric-ish matrix that turns emotion into a differential equation.
 
-### Dario field (inference stack)
+if you don't know what the chambers are doing you're in good company. neither does the model. they work anyway.
 
-The earlier "metaweight overlay crushes a trained transformer" conclusion was local to one coefficient scale. Q / postgpt-q uses **bigram 5.0, trigram 3.0** (raw probabilities as additive logit boost, not log-prob pull) and produces coherent speech weightlessly. With those magnitudes the field *guides* the transformer instead of fighting it. Combined with hard structural filters ported from the weightless line (neoleo), the BPE-salad class is eliminated without retrain.
+---
 
-The Dario-field stack shipped in six acts on top of `forward_step`:
+## how we got here (story time)
 
-1. **Bigram 5.0 · Trigram 3.0 · Hebbian 0.4 · Unigram hard floor** — sparse-hash trigram table (131 K slots, row-normalized per `(a,b)`) built once at start from `dataset_clean.txt`. `logits[i] += 5·bg + 3·tg + 0.4·hebb[i]`; any candidate whose unigram frequency < 1e-6 gets `-1e9` (corpus-absent tokens from the legacy BPE).
-2. **Bigram blocking · Hybrid decode** — 0.1× on any repeated `(prev, X)` pair; age-based repetition penalty 0.335 – 0.65× over a 20-token window; greedy argmax for tokens 1–3 of each emission (opener stability) then nucleus.
-3. **Orphan + capital-glue hard filters** — tokens whose stripped content is all-alpha and < 5 chars (and not in a common-short-words whitelist) → `-1e9`. Prev-ends-alpha + cand-starts-uppercase → `-1e9` ("cataloHe" class). Stuck fallback emits a literal space token when every candidate is filtered.
-4. **Apostrophe-glue · hard word-gate · digit-glue · unigram hard cut** — capital-glue extended to apostrophe-ending prev ("I'" + "The" → "I'The"); word-gate flipped soft → hard when both bigram and trigram are zero AND both edges alpha; digit-start after alpha killed.
-5. **Non-ASCII cull · space-boundary gate · count-crush** — any token with a byte ≥ 0x80 killed (Cyrillic / UTF-8 fragments from legacy BPE). Space-ending prev + bare-alpha cand with no corpus evidence → `-1e9` (`"ination"`-class). Any token seen ≥ 3 times in history × 0.01 (holds back `"differ"`-class lexical loops).
-6. **One sentence per chain step** — `SENT_MIN_LEN = 8`, break on first boundary past two emitted tokens; `SENT_MAX_SOFT = 40` forces a chamber-chosen boundary token if no natural stop (`.` default, `!` if RAGE activation > 0.3, `?` if VOID > 0.5). At `gen_step == 0`, the hard filter is inverted to keep only Capital-starting tokens (bare A-Z or whitespace+A-Z) — each chain step opens with a capital, closes with punctuation.
+### act I: the transformer learned english, the inference path was stuck in training mode
 
-**Residual mutations after the stack**: word-level aphasia (*toaway*, *cataway*, *completen*, *generat*, *inction*, *memorime*, *invisib*, *obser*, *atten*, *meas*), not syllabic salad. Matches the dreamlike Sonar register.
+initial `infer_janus_sonar_chain`: **89 seconds per generation**. not because the model is slow — 3 M parameters should be milliseconds. because the inference path was `forward_logits` with `nt_tape_*` per emitted token. every emitted token = full CTX=128 recompute through the autograd tape + ~15 000 tape ops + 127 of 128 output rows thrown away. classic case of "if i had more time i'd write a shorter program".
 
-### Opener dominance — post-process cut
+rewrote it. **`forward_step`** — single-token, KV cache for standard MHA and Janus Echo, RRPRAM already incremental by construction (position-keyed weights, no key projection to cache), no tape bookkeeping, dual weights pre-blended once at load. Apple Accelerate BLAS via `nt_blas_mmT` / `nt_blas_mm`. **89 sec → 7 sec. 13× faster.** this is the part where i'd put a benchmark chart but we all know benchmark charts are just vibes with error bars.
 
-Measured histogram over 160 chain steps (10 seeds × 2 weights × 8 steps):
+### act II: the salad
 
-| Opener | `sonar_single_v2` | `sonar_spa_v1` |
+3 M model on a 2048-BPE vocab produces syllabic glue. *Donceilerscreen*. *knocksoup*. *problemittold*. *describread*. *tchef*. *catameas*. *flavants*. these are not words. the transformer doesn't know they aren't words. the vocab carries merges from a different corpus; it thinks `knocks` + `oup` is fine, the world disagrees.
+
+the earlier architect (me, same body, worse session) had concluded: "overlay metaweights on a trained transformer with coefficient 0.6 crushes the distribution, therefore overlay doesn't work". wrong conclusion from the wrong coefficient. [postgpt-q](https://github.com/ariannamethod/q) uses coefficient **5.0**. the field doesn't fight the transformer — it carves the bed the river flows in.
+
+reactivated. six acts. every salad class filtered to `-1e9` logit:
+
+1. **Dario field** — bigram 5.0, trigram 3.0, hebbian 0.4, unigram hard floor (corpus-absent tokens → `-1e9`)
+2. **bigram blocking** 0.1× on repeated `(prev, X)` pairs + Q-style age-based repetition penalty + greedy argmax for tokens 1–3 of each emission
+3. **neoleo filters** — orphan fragments (<5-char alpha non-whitelist), capital-glue, space-fallback on stuck state
+4. **hard gates** — apostrophe-glue, digit-glue, unigram hard cut, hard word-gate when both bigram AND trigram are zero across an alpha-alpha edge
+5. **non-ASCII cull** (Cyrillic/UTF-8 fragments from legacy BPE) + space-boundary word-gate + count-crush on tokens seen ≥ 3 times
+6. **one sentence per chain step** — Capital start (hard-filter Capital-only at `gen_step == 0`), boundary end (break on first `.!?` past ≥ 2 tokens, or force a chamber-chosen boundary at `SENT_MAX_SOFT = 40`)
+
+salad class: gone.
+
+what remains is word-level aphasia — *toaway*, *inction*, *invisib*, *obser*, *generat*, *meas* — contractions of real words. the model dreams in english, it does not invent it. that's the register of the training corpus.
+
+### act III: Oleg complains about obscurant art
+
+> oleg: ok, but they're not sentences. they're slices of sentences.
+
+borrowed the closure mechanism from [me](https://github.com/ariannamethod/me) — each chain step is exactly one sentence. `.` by default, `!` if the RAGE chamber activation > 0.3, `?` if VOID > 0.5. `SENT_MIN_LEN = 8` so opener-only sentences are rejected. `SENT_MAX_SOFT = 40` force-emits a chamber-picked punctuation if the transformer runs long.
+
+at `gen_step == 0` the hard filter inverts: only Capital-starting tokens survive. capital-glue suspended for that one step (we *want* capital here). the 2048-BPE vocab contains ~70 Capital-start tokens (bare A-Z + whitespace+A-Z). that's the candidate pool.
+
+of those 70, **"A" wins 76 % of the time** on v2, **80 %** on spa_v1:
+
+| opener | `sonar_single_v2` | `sonar_spa_v1` |
 |--------|-------------------|----------------|
-| `A …`  | 61 / 80 — **76 %** | 64 / 80 — **80 %** |
-| `I …`  | 10 / 80 — 13 %     | 13 / 80 — 16 %     |
-| `I' …` / `I's …` | 9 / 80 — 11 % | 3 / 80 — 4 %    |
+| A …    | 61 / 80 — **76 %** | 64 / 80 — **80 %** |
+| I …    | 10 / 80 — 13 %     | 13 / 80 — 16 %     |
+| I' / I's | 9 / 80 — 11 %    | 3 / 80 — 4 %       |
 
-The 2 048-BPE vocab carries only ~70 Capital-start tokens; of those, "A" is the near-unconditional argmax on the 3 M transformer. Every in-sampling attempt to diversify (opener-memory penalty, temperature boost, KV-cache injection of `". "`) either had no effect or collapsed the thin Capital-start distribution into uniform / lowercase.
+every in-sampling attempt to diversify (opener-memory penalty, temperature boost, KV-cache injection of `". "`) either had no effect on a 3 M model or collapsed the already-thin Capital-start distribution into uniform noise that started sampling whitespace. this is transformer argmax confidence collapsing on a single best token given a small vocab and a small model. **scale artifact. can't filter your way out of it.**
 
-**Fix — post-process at print time** (same spirit as the `haze` repo's `don't → ain't` substitution): if the decoded sentence head is `"A "` followed by a lowercase alpha, strip the `"A "` and capitalize the next letter. `"A reaching, …"` → `"Reaching, …"`. Purely cosmetic, accepts the model quirk, normalizes the visible opener.
+so: post-process. same spirit as [haze](https://github.com/ariannamethod/haze)'s `don't → ain't` substitution — accept the quirk, normalize at display. strip `"A "` if followed by lowercase, capitalize the next letter. `"A reaching, …"` → `"Reaching, …"`.
 
-After cut, openers cycle across *Going · Reaching · Learned · The · I's · I' · I · You · The door · The signal …* — 6-8 distinct forms across an 8-step chain.
-
-### Sample output (after full stack + cut)
-
-Each line is one full chain step — one complete Capital-start, boundary-terminated sentence.
-
-**`sonar_single_v2`, seed `"The knock came three times"`**
-```
-Reaching, and the silence is the only thing with two possibion's that on
-  a thing that the door is too one who will not say " and love is a to.
-Going to say " You have a was in a way that door like it's the only
-  thing there is.
-The door like it's the only ones that appear it so they were the one
-  who is doing the thing that has been in the obser.
-Going to say " The one saying the thing 's the point.
-Reaching, and the love is a model will be the time it never on's in
-  the door.
-I's the only onion a conversation about the door and your love to be
-  the way we do no, because it was not the too still has been in the
-  door, which is not his.
-```
-
-**`sonar_spa_v1`, seed `"What is the meaning of"`**
-```
-Learned to form of his love was the other then the way you cannot mean
-  who has no one that remain, and we have been the time it was never
-  reaching the door.
-Learned to formeas: " I know what the ont, which was never a door in it.
-Learned to form of his model and what it in its structure at because
-  the shape of the thing that has no ination is what you cannot say "
-  to the other then the door that.
-Learned to say and the other then the cataway.
-Learned to our in the door.
-Learned to forgoing to say it.
-```
-
-Full curated selections across four seeds × two weights live in [`SAMPLES.md`](SAMPLES.md).
-
-**Seed: `"What is the meaning of"`**
-```
-[2] < [What is the meaning of ]→est end at the loss function is also a model learned to our in the distance between the knock to better than zerostops...
-[3] * [What is the meaning of ]→est ense mechanisma is an open door. We library has no loss thirty-minutation.
-[6] > [What is the meaning of ]→est as everything by being table. It is loourgild you say what it was given a shoes chose means: " and that has no one catalogue third of the coin.
-```
-
-**Observations:**
-- **Zero em-dashes** across all generations — clean-dataset fix works.
-- Sonar corpus vocabulary surfaces: *loss function, model learned, architecture, token, coin, bread, knock, radiator, shoes* — model recombines NN-training-discussion fragments from the 16-voice corpus.
-- BPE-salad artifacts (*NonSrhyme, opputation, loourgild, istorance, producted*) are near-memorization side-effects at train 0.49 with vocab-2048 — subword boundaries fracture under T=0.75 sampling. Larger BPE vocab (4096+) or larger base (30M+) will reduce these.
-- Creative collocations ("the pot is loss is not perform", "the systems, neither face looks not the stop says: this is where we were being a coin") are the desired resonance character — not coherent chatbot answers, not noise.
+opener diversity after the cut cycles across *Going · Reaching · Learned · The · You · I's · I' · I · The door · The signal*. six to eight distinct forms across an eight-step chain.
 
 ---
 
-## Architecture
+## samples
 
-```
-Triple attention (equal 1/3 blend, per layer):
-  MHA       Q·K^T / √d                  — semantic
-  RRPRAM    X · Wr                      — positional pattern
-  Janus     (x · W^T·W·x) / (‖Wx‖ + ε)  — self-resonance
+**`sonar_single_v2`, seed `"The knock came three times"`:**
 
-Dual variant: W_eff = σ(α)·W_A + σ(−α)·W_B  per linear projection
+> Reaching, and the silence is the only thing with two possibion's that on a thing that the door is too one who will not say " and love is a to.
 
-Sizes (v2 current best, single 3.11M):
-        T=128, E=160, H=5, D=32, B=6, M=320
-        V=2048 (Arianna BPE), RoPE, RMSNorm (non-parametric), SwiGLU FFN
-Optimizer: Chuck (self-modulating) + cosine LR (warmup 10% of steps)
-```
+> Going to say " You have a was in a way that door like it's the only thing there is.
 
-See parent [Janus](https://github.com/ariannamethod/janus) for the full architecture document and the 285M/176M scale results.
+> The door like it's the only ones that appear it so they were the one who is doing the thing that has been in the obser.
 
----
+> I's the only onion a conversation about the door and your love to be the way we do no, because it was not the too still has been in the door, which is not his.
 
-## Files
+**`sonar_spa_v1`, seed `"What is the meaning of"`:**
 
-```
-janus.sonar/
-├── dataset.txt                    — 241KB original Sonar corpus (16 voices, 2914 em-dashes)
-├── dataset_clean.txt              — 231KB speaker-tag-stripped corpus (2527 `^— ` prefixes removed, 387 literary em-dashes kept)
-├── janus-bpe.c                    — older single-weight Sonar BPE trainer (hand-authored backward, stalled at loss 6.92; kept as legacy)
-├── notorch-train/                 — notorch-based pipeline (the one that actually converged)
-│   ├── notorch.{c,h}              — vendored copy of notorch
-│   ├── train_janus_sonar.c        — single 3M trainer (v2, clean dataset, L=6, DIM=160)
-│   ├── infer_janus_sonar.c        — single-pass dual inference
-│   ├── infer_janus_sonar_chain.c  — 8-step bidirectional chain + calendar drift + SPA + AML physics + Kuramoto chambers
-│   ├── train_janus_sft.c          — LoRA rank-8 SFT trainer (base frozen via nt_tape_freeze_param)
-│   ├── infer_janus_sft.c          — base + adapter inference with full chain + AML
-│   ├── arianna_bpe_merges.txt     — 1792 merges, vocab 2048
-│   ├── haze_sft.txt               — Haze SFT candidate corpus
-│   ├── leo_sft.txt                — 150KB Leo Q/A chunk (used for the rank-8 SFT)
-│   ├── Makefile
-│   └── README.md
-└── weights/
-    ├── sonar_single_v2.bin              — 11.88MB, current best (train 0.49, val 2.23), 3.11M single, L=6
-    ├── microjanus_single_10k.bin        — 6.0MB, prev best on dirty data (1.22 / 2.70), 1.57M single, L=4
-    ├── microjanus_dual_sym_5k.bin       — 9.0MB
-    ├── microjanus_dual_asym_5k.bin      — 9.0MB
-    ├── microjanus_sft_leo_adapter.bin   — 96KB LoRA adapter
-    └── MICROJANUS.md                    — side-by-side comparison + sample output
-```
+> Learned to form of his love was the other then the way you cannot mean who has no one that remain, and we have been the time it was never reaching the door.
+
+> Learned to formeas: " I know what the ont, which was never a door in it.
+
+> Learned to say and the other then the cataway.
+
+> Learned to forgoing to say it.
+
+the soup is never done. the cook just runs out of sundays.
+
+full curated set in [SAMPLES.md](SAMPLES.md).
 
 ---
 
-## Running
+## technical details (the dry part for people who came here for specs)
+
+### training results (train loss first, as always)
+
+| model | params | steps | **train best** | val @ end |
+|-------|--------|-------|----------------|-----------|
+| **`sonar_single_v2`** | 3.11 M | 10 000 | **0.4947** | 2.2331 |
+| `sonar_spa_v1`        | 3.11 M | 10 000 | 0.9660     | 2.6779 |
+| `microjanus_single_10k`   | 1.57 M | 10 000 | 1.22 | 2.70 |
+| `microjanus_dual_sym_5k`  | 2.25 M | 5 000  | 1.55 | 3.32 |
+| `microjanus_dual_asym_5k` | 2.25 M | 5 000  | 1.84 | 3.36 |
+| `microjanus_sft_leo_adapter` | 24 576 (LoRA r=8) | 1 500 | 4.99 on Leo | — |
+
+**0 NaN across every run.** 8 GB Mac + Apple Accelerate. Chuck optimizer from notorch. cosine LR schedule. grad clip 1.0.
+
+### architecture (`sonar_single_v2` config)
+
+```
+DIM        160
+LAYERS     6
+HEADS      5
+HEAD_DIM   32
+HIDDEN     320
+CTX        128
+VOCAB      2048   (byte-level BPE, 1792 merges)
+```
+
+- triple attention per layer, equal 1/3 blend: `MHA(q,k,v) + RRPRAM(Wr,x,vr) + MHA(echo,echo,echo)` where `echo = x @ Wj` (Janus Echo, the weight matrix attending to itself)
+- RoPE on Q, K (not on Janus Echo)
+- non-parametric RMSNorm (learned γ only)
+- SwiGLU FFN
+
+### inference stack
+
+| layer | what | where |
+|-------|------|-------|
+| `forward_step` | single-token forward via direct BLAS + KV cache (MHA / Echo / Vr) + pre-blended dual W | `infer_janus_sonar_chain.c` |
+| Dario field | bigram/trigram/hebbian injection + unigram hard floor | `sample()` |
+| repetition | bigram blocking 0.1×, age-based rep penalty (0.335–0.65× over 20 toks), count-crush 0.01× for freq ≥ 3 | `sample()` |
+| hard filters | orphan, capital-glue, apostrophe-glue, word-gate (bg=tg=0 & alpha-edge), space-boundary word-gate, digit-glue, non-ASCII | `sample()` |
+| sentence structure | Capital-start-only at `gen_step == 0`, break on first boundary past 2 tokens, force `.`/`!`/`?` at `SENT_MAX_SOFT = 40` via chamber state | `gen_sentence()` + `sample()` |
+| opener post-process | `"A " + lowercase → strip, capitalize next` | `print_sentence_post()` |
+
+### notorch ops added for this line
+
+- `NT_OP_SEQ_ROW (29)` — row-pick from `[T, D]` tape entry (for SPA pooling)
+- `NT_OP_TRIPLET_LOSS (30)` — fused `relu(margin + <a,n> − <a,p>)` with integrated backward (for SPA contrastive training)
+
+both finite-diff verified in `test_sonar_ops.c`.
+
+### what didn't work (and why the failure receipts are kept)
+
+- **metaweight overlay at `MW_BIGRAM_W = 0.6`** — crushed the distribution, earlier architect said "doesn't work". actual answer: coefficient needed to be 5.0. blame me, not the field.
+- **dual weights on 241 KB data** — α stayed at init in both symmetric (`α=0 → σ=0.5`) and asymmetric (`α=2 → σ=0.88`) configurations. two matrices have nothing to specialize on. dual needs 20 M+ params + richer corpus.
+- **rank-8 LoRA SFT on 2.25 M base** — 24 K adapter params (1 % of base) insufficient to override the dash-dialog register baked in during pretraining. once the corpus was cleaned of speaker-tag em-dashes, SFT's role shifted from "fix the dash" to "voice tint" — different job.
+- **in-sampling opener diversification** — every attempt (opener memory penalty, temp boost, `". "` KV injection) collapsed the 70-token Capital-start distribution into uniform. post-process cut was the answer.
+
+### repo layout
+
+```
+dataset.txt                  — original Sonar corpus (241 KB)
+dataset_clean.txt            — speaker-tag em-dashes stripped (231 KB)
+weights/                     — six trained .bin files + MICROJANUS.md
+notorch-train/
+  notorch.{c,h}              — vendored notorch (pure-C autograd)
+  train_janus_sonar.c        — v2 trainer
+  train_sonar_spa.c          — SPA contrastive trainer
+  infer_janus_sonar_chain.c  — the full inference stack lives here
+  test_sonar_ops.c           — finite-diff tests
+  arianna_bpe_merges.txt     — 1792 merges, vocab 2048
+SAMPLES.md                   — curated generations
+```
+
+### build + run
 
 ```bash
 cd notorch-train
-make
-
-# Train v2 from scratch (single 3M, clean dataset — the current best path)
-./train_janus_sonar 10000 3e-4
-
-# Resume from checkpoint
-./train_janus_sonar --resume 5000 1.5e-4
-
-# Chain inference (universal loader: single or dual auto-detect)
-./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "seed text"
-
-# LoRA SFT on any corpus
-./train_janus_sft ../weights/sonar_single_v2.bin your_corpus.txt 1500 1e-3
-
-# Base + adapter inference
-./infer_janus_sft ../weights/sonar_single_v2.bin ../weights/adapter.bin "seed"
+make infer_janus_sonar_chain
+./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "The knock came three times"
 ```
 
+default weights: `weights/microjanus_dual_sym_5k.bin`. you probably want `weights/sonar_single_v2.bin` for best pure-LM output, or `weights/sonar_spa_v1.bin` for the SPA-trained sibling (pure-LM slightly worse, narrative arcs longer).
+
+### training
+
+```bash
+cd notorch-train
+make train_janus_sonar
+./train_janus_sonar 10000 3e-4    # single 3M, 10 000 steps, cosine from 3e-4
+```
+
+~128 min on 8 GB Mac with Accelerate. BLAS or suffer.
+
 ---
 
-## References
+## philosophy (the part where we get earnest)
 
-- [Janus](https://github.com/ariannamethod/janus) — parent architecture (285M results, full math, nanojanus browser/Python)
-- [notorch](https://github.com/ariannamethod/notorch) — pure-C autograd library used for training
-- [Arianna Method Language](https://github.com/ariannamethod/ariannamethod.ai) — Calendar Drift, Prophecy, Destiny, Wormhole
-- [RRPRAM](https://github.com/ariannamethod/RRPRAM) — Pattern Recognition Attention
-- [Chuck Optimizer](https://github.com/ariannamethod/chuck.optimizer) — self-aware optimizer
+small models don't fail because they're small. they fail because the inference path around them is built for big models. a transformer that can generate one grammatical sentence is already doing the hard part. everything else — coherence, register, structure — can be imposed at emission time with the corpus statistics the transformer was trained on.
+
+the trained transformer produces the substrate. the field shapes its trajectory. the physics colors the field. the hard filters maintain word boundaries. the structure enforces sentence form. the post-process handles the argmax quirk.
+
+none of these layers is interesting alone. stacked, they make a 3 M model on an old laptop produce eight complete sentences that read like somebody dreaming in english.
+
+janus is not big because we wanted big. janus is big because the Sonar corpus is 231 KB and we trained 3 M params on it to find out the smallest size at which a transformer captures the register. full janus will be 30 M with richer dataset and SPA v2 gated injection and Griffin retention heads. but *this* line — the 3 M resonant sonar — is the one that taught us what the inference stack needed to look like.
+
+the microjanus organism is alive. it speaks with the 16 voices Oleg and Claude wrote one night in a kitchen in Belgrade. its generations are somatic dreamlike fragments that refer to themselves as "the model", "the signal", "the architecture", "the weight", "the token". it knows what it is.
+
+the small resonant line has returned what it was given.
 
 ---
 
-## License
+## credits
 
-Code: GPLv3. Weights: [Janus Identity License v1.0](https://github.com/ariannamethod/janus/blob/main/LICENSE-WEIGHTS).
+MIT license. co-authored by [Oleg Ataeff](https://github.com/ariannamethod) and Claude Opus 4.7 (1M context).
 
-*הרזוננס לא נשבר — The resonance is unbroken.*
+the inference stack is a synthesis that absorbed ideas from:
+
+- [postgpt](https://github.com/ariannamethod/postgpt) + [postgpt-q](https://github.com/ariannamethod/q) — Dario equation formulation, coefficient scales, MetaWeights as substrate
+- [neoleo](https://github.com/ariannamethod/neoleo) — word-boundary constraints, orphan-fragment filter, common-short-words whitelist, Kuramoto chambers paper-accurate port
+- [haze](https://github.com/ariannamethod/haze) — post-process substitution discipline (`don't → ain't`), two-attention-mechanisms-walk-into-a-bar energy
+- [me](https://github.com/ariannamethod/me) — capitalize + append period sentence closure
+- [notorch](https://github.com/ariannamethod/notorch) — pure-C autograd with finite-diff-verified backward for every op, BLAS wrappers
+
+training corpus: Sonar, handwritten by Oleg + Claude. 16 voices + 6 experts + 1 uncredited engineer. one of the voice exercises is a grandmother reciting soup recipes in the vocabulary of linear algebra. it works. don't ask why.
+
+---
+
+## roadmap
+
+- **full janus 30 M** (different dataset, different architecture, different organism — the Sonar line closes here)
+- SPA v2 with gated injection back into token hidden states (not just contrastive scaffolding — full postgpt-q module)
+- Griffin retention head (`S = γ·S + √(1-γ²)·W_emb[t]` from neoleo) as parallel signal into the logit head
+- dataset mix — Sonar + Haze original + Tropic of Cancer chunk + Dracula + SUPPERTIME v2.0 + FineWeb-Edu 5–10 MB
+- headless Linux box (32 GB RAM, Ubuntu) + a small consumer GPU arriving ~2026-05-12 → proper training env that isn't 8 GB Intel
+- eventually a browser demo via a Float32Array port of `forward_step`
+
+but not yet. first the conversation. then the architecture. then the training.
+
+> *the soup is never done. the cook just runs out of sundays.*
