@@ -733,6 +733,22 @@ static int tok_ends_apos(int tok) {
 static int tok_ends_alpha_or_apos(int tok) {
     return tok_ends_alpha(tok) || tok_ends_apos(tok);
 }
+static int tok_ends_ws(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    int len = g_bpe->token_len[tok]; if (len == 0) return 0;
+    unsigned char c = g_bpe->tokens[tok][len-1];
+    return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+}
+/* Any byte >= 0x80 indicates non-ASCII (Cyrillic, UTF-8 multi-byte fragments,
+   emoji bytes, etc.). Legacy BPE file contains such tokens — filter them out
+   of emission for an English Sonar organism. */
+static int tok_has_high_byte(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    int len = g_bpe->token_len[tok];
+    for (int i = 0; i < len; i++)
+        if (g_bpe->tokens[tok][i] >= 0x80) return 1;
+    return 0;
+}
 
 /* ── neoleo-ported orphan + capital-glue filters ── */
 
@@ -839,26 +855,29 @@ static int sample(float* logits, int n, float temp, float top_p,
         int prev_alpha_apos = tok_ends_alpha_or_apos(prev);
         float hebb[VOCAB];
         mw_hebb_query(history, hist_n, hebb, n);
+        int prev_space = tok_ends_ws(prev);
         for (int i = 0; i < n; i++) {
             float bg = (prev >= 0 && prev < VOCAB) ? g_mw_bigram[prev][i] : 0;
             float tg = (prev2 >= 0) ? mw_trigram(prev2, prev, i) : 0;
             logits[i] += MW_BIGRAM_W * bg + MW_TRIGRAM_W * tg + MW_HEBB_W * hebb[i];
-            /* Hard unigram cut: BPE merges file is legacy — includes tokens
-               the Sonar corpus never contained. These are noise by
-               definition. Kill absolutely. */
             if (g_mw_unigram[i] < MW_UNIGRAM_FLOOR) logits[i] = -1e9f;
-            /* Hard word-gate: prev ends alpha-or-apos + cand starts alpha +
-               the corpus never saw this pair bigram-wise or in trigram
-               context → guaranteed salad glue. */
+            /* Hard word-gate: prev ends alpha-or-apos + cand starts alpha →
+               mid-word continuation without corpus evidence is salad. */
             if (prev_alpha_apos && tok_starts_alpha(i) && bg < 1e-6f && tg < 1e-6f)
                 logits[i] = -1e9f;
-            /* Digit-glue: prev ends alpha + cand starts digit → "differ192"
-               class. Corpus uses digits very sparingly, usually after space
-               or punctuation — almost never immediately after a word. */
+            /* Extended word-gate: prev ends space/newline + cand starts bare
+               alpha (no leading space) = a "continuation-shaped" token
+               dropped at a word boundary. Without corpus evidence this is
+               "ination"-class mid-word debris. */
+            if (prev_space && tok_starts_alpha(i) && bg < 1e-6f && tg < 1e-6f)
+                logits[i] = -1e9f;
+            /* Digit-glue: prev ends alpha + cand starts digit. */
             if (prev_alpha_apos && g_bpe && g_bpe->token_len[i] > 0) {
                 unsigned char c0 = g_bpe->tokens[i][0];
                 if (c0 >= '0' && c0 <= '9') logits[i] = -1e9f;
             }
+            /* Non-ASCII: Cyrillic / multi-byte fragments from legacy BPE. */
+            if (tok_has_high_byte(i)) logits[i] = -1e9f;
         }
     }
 
@@ -883,6 +902,20 @@ static int sample(float* logits, int n, float temp, float top_p,
                 if (pen > 1.0f) pen = 1.0f;
                 if (logits[tok] > 0) logits[tok] *= pen;
                 else                 logits[tok] *= (2.0f - pen);
+            }
+        }
+        /* Count-based crush: token seen ≥3 times anywhere in history →
+           near-extinction. Catches lexical loops ("differ" x5) that the
+           age-window alone can't hold. */
+        int counts[VOCAB]; memset(counts, 0, sizeof(counts));
+        for (int i = 0; i < hist_n; i++) {
+            int t = history[i];
+            if (t >= 0 && t < n) counts[t]++;
+        }
+        for (int t = 0; t < n; t++) {
+            if (counts[t] >= 3) {
+                if (logits[t] > 0) logits[t] *= 0.01f;
+                else               logits[t] *= 5.0f;  /* push deeply negative */
             }
         }
     }
