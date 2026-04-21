@@ -239,7 +239,7 @@ the small resonant line has returned what it was given.
 
 ## credits
 
-MIT license. co-authored by [Oleg Ataeff](https://github.com/ariannamethod) and Claude Opus 4.7 (1M context).
+GPLv3 license. co-authored by [Oleg Ataeff](https://github.com/ariannamethod) and Claude Opus 4.7 (1M context).
 
 the inference stack is a synthesis that absorbed ideas from:
 
