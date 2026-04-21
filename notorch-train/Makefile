@@ -15,7 +15,7 @@ ifeq ($(UNAME), Linux)
   BLAS_NAME = OpenBLAS
 endif
 
-.PHONY: all clean
+.PHONY: all clean eval eval-full
 
 all: train_janus_sonar infer_janus_sonar infer_janus_sonar_chain train_janus_sft infer_janus_sft train_sonar_spa test_sonar_ops
 
@@ -46,6 +46,12 @@ train_janus_sft: train_janus_sft.c notorch.c notorch.h
 infer_janus_sft: infer_janus_sft.c notorch.c notorch.h
 	$(CC) $(CFLAGS) $(BLAS_FLAGS) -o infer_janus_sft infer_janus_sft.c notorch.c -lm
 	@echo "Compiled: infer_janus_sft (base + LoRA adapter, $(BLAS_NAME))"
+
+eval: infer_janus_sonar_chain
+	./eval_sonar_chain.sh --quick
+
+eval-full: infer_janus_sonar_chain
+	./eval_sonar_chain.sh --full
 
 clean:
 	rm -f train_janus_sonar infer_janus_sonar infer_janus_sonar_chain

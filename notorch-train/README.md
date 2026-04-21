@@ -69,6 +69,17 @@ Inference modes:
 - `clinical` — lab/model/signal motifs
 - `dialogue` — speech/quote motifs
 
+Evaluation harness:
+```bash
+make eval       # 5-prompt smoke suite
+make eval-full  # 20-prompt suite
+./eval_sonar_chain.sh --full --mode ritual --weights ../weights/sonar_spa_v1.bin
+```
+
+The harness reports boundary closure, quote balance, bad-fragment hits,
+motif recurrence, opener collapse, and average generated length. Pass
+`--keep DIR` to store raw chain dumps.
+
 Changing `arianna_bpe_merges.txt` is not a safe cleanup for existing weights:
 token ids index directly into `wte` and `head`. Current BPE hygiene is
 inference-time filtering/scoring; a true Sonar-BPE v2 requires retraining.
@@ -129,7 +140,8 @@ ensemble of two Xavier-init matrices, not from learned blend.
   fragment BPE joins are suppressed.
 - `Makefile` targets `train_janus_sonar`, `infer_janus_sonar`,
   `infer_janus_sonar_chain`, `train_janus_sft`, `infer_janus_sft`,
-  `train_sonar_spa`, `test_sonar_ops`
+  `train_sonar_spa`, `test_sonar_ops`, `eval`, `eval-full`
+- `eval_sonar_chain.sh` — fixed-prompt regression harness for chain output
 
 ## Sample chain-inference output
 

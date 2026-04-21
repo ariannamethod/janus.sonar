@@ -71,6 +71,22 @@ organism.
 
 > Is that a metaphor, you say it and the other one that is not a mirror, and the one who has been the signal generates, because it and they were at is the only thing that has no one of them.
 
+## Eval Harness
+
+The harness runs fixed prompts through the current chain and reports cheap
+regression metrics: boundary closure, quote balance, bad-fragment hits,
+motif recurrence, opener collapse.
+
+```bash
+cd notorch-train
+make eval
+make eval-full
+./eval_sonar_chain.sh --full --mode ritual --weights ../weights/sonar_spa_v1.bin
+```
+
+`make eval` uses the first 5 prompts. `make eval-full` uses the 20-prompt
+suite. Use `--keep DIR` to save raw chain dumps for inspection.
+
 ## What It Is
 
 Current model:
