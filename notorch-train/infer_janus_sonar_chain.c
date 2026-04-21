@@ -726,12 +726,95 @@ static int tok_starts_alpha(int tok) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
+/* ── neoleo-ported orphan + capital-glue filters ── */
+
+static int is_common_short_word_buf(const unsigned char* b, int len) {
+    if (len < 1 || len > 4) return 0;
+    char low[6] = {0};
+    for (int i = 0; i < len; i++) {
+        unsigned char c = b[i];
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c - 'A' + 'a');
+        low[i] = (char)c;
+    }
+    low[len] = 0;
+    static const char* wl[] = {
+        /* 1-char */
+        "a","i","o",
+        /* 2-char */
+        "ah","oh","hi","no","so","is","it","an","at","be","by","do","go",
+        "he","if","in","me","my","of","on","or","to","up","us","we","am",
+        "as","ok","yo",
+        /* 3-char */
+        "the","and","but","you","she","her","his","its","all","how","who",
+        "why","our","out","ago","any","let","now","day","one","two","six",
+        "ten","new","old","yes","far","saw","got","had","has","him",
+        "was","not","for","off","own","too","may","way","say","see","ask",
+        "add","put","get","run","sat","sit","yet","mom","dad",
+        "boy","bad","big","red","sun","cat","dog","bed","hot","eye","ear",
+        /* 4-char — common function + sonar-register nouns */
+        "this","that","with","have","from","they","were","will","what",
+        "your","when","said","want","been","only","some","then","more",
+        "just","into","over","them","know","like","time","here","take",
+        "back","come","door","bone","soup","coin","knock","haze","shoe",
+        "wall","room","love","loss","room","night","dark","hard","soft",
+        NULL
+    };
+    for (const char** w = wl; *w; w++) if (!strcmp(low, *w)) return 1;
+    return 0;
+}
+
+/* Orphan fragment: content stripped of ws is all alpha, <5 chars, and not
+   a known common short word. These are BPE artifacts like "m", "Wo",
+   "tchef" that glue onto neighbors into salad. Hard-exclude. */
+static int is_orphan_fragment_bpe(int id) {
+    if (!g_bpe || id < 0 || id >= g_bpe->vocab_size) return 0;
+    int len = g_bpe->token_len[id];
+    if (len == 0) return 0;
+    const unsigned char* b = g_bpe->tokens[id];
+    int s = 0, e = len;
+    while (s < e && (b[s]==' '||b[s]=='\n'||b[s]=='\r'||b[s]=='\t')) s++;
+    while (e > s && (b[e-1]==' '||b[e-1]=='\n'||b[e-1]=='\r'||b[e-1]=='\t')) e--;
+    if (s == e) return 0;
+    for (int i = s; i < e; i++) {
+        unsigned char c = b[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return 0;
+    }
+    int clen = e - s;
+    if (clen >= 5) return 0;
+    if (is_common_short_word_buf(b + s, clen)) return 0;
+    return 1;
+}
+
+/* Capital glue: prev token ends alpha + cand starts uppercase alpha →
+   guaranteed cross-sentence token-glue ("catalo" + "He" → "cataloHe"). */
+static int is_capital_glue_bpe(int prev_tok, int cand_id) {
+    if (!tok_ends_alpha(prev_tok)) return 0;
+    if (!g_bpe || cand_id < 0 || cand_id >= g_bpe->vocab_size) return 0;
+    if (g_bpe->token_len[cand_id] == 0) return 0;
+    unsigned char c = g_bpe->tokens[cand_id][0];
+    return c >= 'A' && c <= 'Z';
+}
+
+/* Find the single-byte space token (BPE byte-level: id 32). Used as
+   stuck-fallback when every candidate got hard-filtered. */
+static int find_space_token(void) {
+    if (!g_bpe) return -1;
+    for (int i = 0; i < g_bpe->vocab_size; i++) {
+        if (g_bpe->token_len[i] == 1 && g_bpe->tokens[i][0] == ' ') return i;
+    }
+    return -1;
+}
+
 /* Sample from logits with AML field pre-applied (if field != NULL).
    Returns chosen token index. Also returns field-adjusted logits
-   in `field_out` so caller can compute prophecy_debt. */
+   in `field_out` so caller can compute prophecy_debt.
+
+   `gen_step` = number of tokens already emitted this sentence past the
+   prompt. First 4 emissions go greedy (stabilize sentence opening, Q
+   style); rest go nucleus. Pass -1 to force nucleus always (legacy). */
 static int sample(float* logits, int n, float temp, float top_p,
                   const AMLField* field, float* field_out,
-                  const int* history, int hist_n) {
+                  const int* history, int hist_n, int gen_step) {
     if (history && hist_n > 0) apply_rep_penalty(logits, history, hist_n);
     if (field) aml_apply_field(logits, n, field);
 
@@ -759,7 +842,52 @@ static int sample(float* logits, int n, float temp, float top_p,
         }
     }
 
+    /* Bigram blocking (Q-style anti-repetition on pairs): for every past
+       occurrence history[i]==prev, dampen the token that followed it. */
+    if (history && hist_n >= 2) {
+        int prev = history[hist_n - 1];
+        for (int i = 0; i < hist_n - 1; i++) {
+            if (history[i] == prev) {
+                int blocked = history[i + 1];
+                if (blocked >= 0 && blocked < n) logits[blocked] *= 0.2f;
+            }
+        }
+    }
+
+    /* ── Hard filters (neoleo): orphan fragments + capital glue ──
+       Multiplicative soft penalties from the field can be outvoted by a
+       strong transformer prior. Hard-exclude is needed for "Donceilerscreen"
+       / "knocksoup" / capital-after-alpha class. Count survivors to detect
+       stuck-mid-word state. */
+    int survivors = 0;
+    int prev_tok = (history && hist_n > 0) ? history[hist_n - 1] : -1;
+    for (int i = 0; i < n; i++) {
+        int killed = 0;
+        if (is_orphan_fragment_bpe(i)) killed = 1;
+        else if (prev_tok >= 0 && is_capital_glue_bpe(prev_tok, i)) killed = 1;
+        if (killed) logits[i] = -1e9f;
+        else survivors++;
+    }
+    /* Stuck fallback: every candidate filtered out → emit a literal space so
+       the dangling alpha tail closes cleanly, then the next step opens a
+       new word with proper boundary. */
+    if (survivors == 0) {
+        int sp = find_space_token();
+        if (sp >= 0) {
+            if (field_out) memcpy(field_out, logits, n * sizeof(float));
+            return sp;
+        }
+    }
+
     if (field_out) memcpy(field_out, logits, n * sizeof(float));
+
+    /* Hybrid decode: first 4 emitted tokens of a sentence go greedy argmax
+       to anchor the opening before nucleus kicks in. */
+    if (gen_step >= 0 && gen_step < 4) {
+        int best = 0; float bm = logits[0];
+        for (int i = 1; i < n; i++) if (logits[i] > bm) { bm = logits[i]; best = i; }
+        return best;
+    }
 
     for (int i = 0; i < n; i++) logits[i] /= temp;
     float mx = logits[0]; for (int i=1;i<n;i++) if(logits[i]>mx) mx=logits[i];
@@ -835,10 +963,12 @@ static int gen_sentence(Model* m, const nt_bpe* bpe,
     for (int i = 0; i < ol; i++) forward_step(m, out[i], i, logits);
 
     int pos = ol;
+    int prompt_len = plen;
     while (ol < out_cap && pos < CTX) {
         float lbuf[VOCAB]; memcpy(lbuf, logits, VOCAB * sizeof(float));
         float field_adj[VOCAB];
-        int next = sample(lbuf, VOCAB, temp, 0.95f, field, field_adj, out, ol);
+        int gen_step = ol - prompt_len;
+        int next = sample(lbuf, VOCAB, temp, 0.95f, field, field_adj, out, ol, gen_step);
 
         if (field) {
             field->prophecy_debt = field->prophecy_debt * field->debt_decay
