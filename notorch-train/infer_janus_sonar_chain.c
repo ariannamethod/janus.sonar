@@ -2,22 +2,23 @@
  * infer_janus_sonar_chain.c — Janus bidirectional chain inference.
  *
  * 8-step chain with calendar-drift compass (forward vs backward ratio),
- * Schumann resonance temperature modulation, best-of-3 per step,
+ * Schumann resonance temperature modulation, best-of-5 per step,
  * destiny EMA across the chain, and SPA (Sentence Phonon Attention)
  * reseed of the weakest sentence at the end.
  *
  * Supports both legacy dual weights and the 3M single-weight Sonar line.
- * Coherence scored by unique-token ratio + length bonus; corpus statistics
- * and AML chamber state are applied during emission.
+ * Coherence scored by unique-token ratio + closure critic + motif ledger;
+ * corpus statistics and AML chamber state are applied during emission.
  *
  *   make infer_janus_sonar_chain
- *   ./infer_janus_sonar_chain janus_sonar.bin "seed text" [rng_seed]
+ *   ./infer_janus_sonar_chain janus_sonar.bin "seed text" [rng_seed] [mode]
  */
 #include "notorch.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
 #include <sys/time.h>
 #include <math.h>
@@ -34,9 +35,40 @@
 #define SENT_MAX       200     /* absolute buffer cap */
 #define SENT_MIN_LEN   8       /* allow short sentences, break on first */
 #define SENT_MAX_SOFT  40      /* force boundary if reached without one */
-#define CAND_N         3       /* best-of-N candidates per step */
+#define CAND_N         5       /* best-of-N candidates per step */
 #define REP_WINDOW     64
 #define REP_PENALTY    0.65f
+
+typedef enum {
+    MODE_BALANCED = 0,
+    MODE_COHERENT,
+    MODE_RITUAL,
+    MODE_CLINICAL,
+    MODE_DIALOGUE,
+    MODE_COUNT
+} GenMode;
+
+typedef struct {
+    const char* name;
+    float temp_shift;
+    float top_p;
+    float closure_w;
+    float motif_w;
+    float destiny_bias;
+    float entropy_floor;
+    float resonance_ceiling;
+    float pain;
+} ModeCfg;
+
+static const ModeCfg MODE_CFG[MODE_COUNT] = {
+    {"balanced",  0.00f, 0.95f, 0.55f, 0.28f, 0.20f, 0.10f, 0.95f, 0.00f},
+    {"coherent", -0.08f, 0.90f, 0.95f, 0.18f, 0.27f, 0.16f, 0.88f, 0.00f},
+    {"ritual",   0.05f, 0.97f, 0.45f, 0.70f, 0.18f, 0.12f, 0.97f, 0.02f},
+    {"clinical", -0.05f, 0.92f, 0.80f, 0.36f, 0.25f, 0.14f, 0.90f, 0.00f},
+    {"dialogue", -0.02f, 0.94f, 0.82f, 0.34f, 0.22f, 0.13f, 0.91f, 0.00f}
+};
+
+static GenMode g_mode = MODE_BALANCED;
 
 /* ── AML physics state (field) ── */
 /* Port of core/ariannamethod.c logit transformations: destiny, suffering,
@@ -79,6 +111,28 @@ static void aml_init(AMLField* f) {
         { 0.10f, 0.20f, 0.30f, 0.40f, 0.30f, 0.00f}
     };
     memcpy(f->ch_coup, coup, sizeof(coup));
+}
+
+static void aml_apply_mode(AMLField* f, const ModeCfg* cfg) {
+    f->destiny_bias = cfg->destiny_bias;
+    f->entropy_floor = cfg->entropy_floor;
+    f->resonance_ceiling = cfg->resonance_ceiling;
+    f->pain = cfg->pain;
+    if (!strcmp(cfg->name, "coherent")) {
+        f->ch_act[CH_FLOW] += 0.18f;
+        f->ch_act[CH_CMPLX] += 0.10f;
+    } else if (!strcmp(cfg->name, "ritual")) {
+        f->ch_act[CH_LOVE] += 0.22f;
+        f->ch_act[CH_VOID] += 0.18f;
+        f->ch_act[CH_CMPLX] += 0.12f;
+    } else if (!strcmp(cfg->name, "clinical")) {
+        f->ch_act[CH_FLOW] += 0.20f;
+        f->ch_act[CH_CMPLX] += 0.18f;
+        f->ch_act[CH_LOVE] *= 0.5f;
+    } else if (!strcmp(cfg->name, "dialogue")) {
+        f->ch_act[CH_LOVE] += 0.16f;
+        f->ch_act[CH_FLOW] += 0.12f;
+    }
 }
 
 /* Kuramoto crossfire step: act[i] += K·sum_j(coup[i][j]·sin(act[j]-act[i])), then decay */
@@ -694,6 +748,134 @@ static int tok_has_newline(int tok) {
     return 0;
 }
 
+static void ascii_lower_copy(const char* in, char* out, int cap);
+static int contains_ascii(const char* hay, const char* needle);
+
+/* Inference-time BPE hygiene. This does not change vocab ids or merges, so
+   existing weights remain valid; it only suppresses known toxic fragments
+   that the 3M model tends to over-promote into aphasic word glue. */
+static int tok_has_bad_fragment(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    char raw[NT_BPE_MAX_TOKEN_LEN + 1];
+    int len = nt_bpe_decode(g_bpe, &tok, 1, raw, NT_BPE_MAX_TOKEN_LEN);
+    if (len <= 0) return 0;
+    raw[len] = 0;
+    char low[NT_BPE_MAX_TOKEN_LEN + 1];
+    ascii_lower_copy(raw, low, (int)sizeof(low));
+    char* p = low;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    static const char* rare_bad[] = {
+        "catamean", "decigare", "noion", "aniain", "tchef", "baher",
+        "staything", "bon'm", "forgoing", "oniaways", "toaways",
+        "metho", "literat", "obser", "onid", "oniain", "formean",
+        "ameas", "completen", "noid", "possibion", "doorat", NULL
+    };
+    for (const char** b = rare_bad; *b; b++)
+        if (contains_ascii(p, *b)) return 1;
+    static const char* exact_bad[] = {
+        "meas", "inction", "iction", "atten", "differ\"", NULL
+    };
+    for (const char** b = exact_bad; *b; b++)
+        if (!strcmp(p, *b)) return 1;
+    return 0;
+}
+
+static int tok_trimmed_lower(int tok, char* out, int cap) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size || cap <= 0) return 0;
+    char raw[NT_BPE_MAX_TOKEN_LEN + 1];
+    int len = nt_bpe_decode(g_bpe, &tok, 1, raw, NT_BPE_MAX_TOKEN_LEN);
+    if (len <= 0) { out[0] = 0; return 0; }
+    raw[len] = 0;
+    char low[NT_BPE_MAX_TOKEN_LEN + 1];
+    ascii_lower_copy(raw, low, (int)sizeof(low));
+    int s = 0, e = (int)strlen(low);
+    while (s < e && (low[s] == ' ' || low[s] == '\t' || low[s] == '\n' || low[s] == '\r')) s++;
+    while (e > s && (low[e-1] == ' ' || low[e-1] == '\t' || low[e-1] == '\n' || low[e-1] == '\r')) e--;
+    int n = e - s;
+    if (n >= cap) n = cap - 1;
+    if (n > 0) memcpy(out, low + s, n);
+    out[n] = 0;
+    return n;
+}
+
+static int tok_trimmed_equals(int tok, const char* word) {
+    char buf[NT_BPE_MAX_TOKEN_LEN + 1];
+    tok_trimmed_lower(tok, buf, (int)sizeof(buf));
+    return !strcmp(buf, word);
+}
+
+static int tok_starts_text(int tok, const char* prefix) {
+    char buf[NT_BPE_MAX_TOKEN_LEN + 1];
+    tok_trimmed_lower(tok, buf, (int)sizeof(buf));
+    return strncmp(buf, prefix, strlen(prefix)) == 0;
+}
+
+static int tok_has_leading_ws_apos(int tok) {
+    if (!g_bpe || tok < 0 || tok >= g_bpe->vocab_size) return 0;
+    char raw[NT_BPE_MAX_TOKEN_LEN + 1];
+    int len = nt_bpe_decode(g_bpe, &tok, 1, raw, NT_BPE_MAX_TOKEN_LEN);
+    if (len <= 0) return 0;
+    raw[len] = 0;
+    int i = 0;
+    if (!(raw[i] == ' ' || raw[i] == '\t' || raw[i] == '\n' || raw[i] == '\r')) return 0;
+    while (raw[i] == ' ' || raw[i] == '\t' || raw[i] == '\n' || raw[i] == '\r') i++;
+    return raw[i] == '\'';
+}
+
+static int tok_is_bad_boundary_prev(int tok) {
+    char buf[NT_BPE_MAX_TOKEN_LEN + 1];
+    tok_trimmed_lower(tok, buf, (int)sizeof(buf));
+    static const char* bad[] = {
+        "the","and","or","of","to","in","as","is","be","will","who",
+        "for","with","that","which","when","where","from","into","by",
+        "because","if","than","then","was","were","are","a","an", NULL
+    };
+    for (const char** p = bad; *p; p++)
+        if (!strcmp(buf, *p)) return 1;
+    return 0;
+}
+
+static int candidate_forms_bad_fragment(const int* history, int hist_n, int cand) {
+    if (!g_bpe || !history || hist_n < 0) return 0;
+    int ids[8];
+    int n = 0;
+    int start = hist_n - 6;
+    if (start < 0) start = 0;
+    for (int i = start; i < hist_n && n < 7; i++) ids[n++] = history[i];
+    ids[n++] = cand;
+    char raw[512], low[512];
+    int olen = 0;
+    char tmp[NT_BPE_MAX_TOKEN_LEN + 1];
+    for (int i = 0; i < n && olen < (int)sizeof(raw) - NT_BPE_MAX_TOKEN_LEN - 1; i++) {
+        int len = nt_bpe_decode(g_bpe, &ids[i], 1, tmp, NT_BPE_MAX_TOKEN_LEN);
+        if (len > 0) { memcpy(raw + olen, tmp, len); olen += len; }
+    }
+    raw[olen] = 0;
+    ascii_lower_copy(raw, low, (int)sizeof(low));
+    static const char* bad[] = {
+        "catamean", "decigare", "noion", "aniain", "tchef", "baher",
+        "staything", "bon'm", "forgoing", "oniaways", "toaways",
+        "metho", "literat", "i's", "only onion", " onion", "onid",
+        "oniain", "formean", "ameas", "completen", " inations",
+        "beat's", "noid", "possibion", "doorat", " inall", " on's",
+        "differ\"", NULL
+    };
+    for (const char** p = bad; *p; p++)
+        if (contains_ascii(low, *p)) return 1;
+    if (contains_ascii(low, "i'") &&
+        !contains_ascii(low, "i'm") &&
+        !contains_ascii(low, "i'll") &&
+        !contains_ascii(low, "i've") &&
+        !contains_ascii(low, "i'd"))
+        return 1;
+    if (contains_ascii(low, "it'") &&
+        !contains_ascii(low, "it's") &&
+        !contains_ascii(low, "it'll") &&
+        !contains_ascii(low, "it'd"))
+        return 1;
+    return 0;
+}
+
 static int is_sentence_punct(unsigned char c) {
     return c == '.' || c == '!' || c == '?';
 }
@@ -970,6 +1152,18 @@ static int sample(float* logits, int n, float temp, float top_p,
         if (!killed && gen_step + 1 < SENT_MIN_LEN && tok_has_boundary(i)) killed = 1;
         if (!killed && tok_has_newline(i)) killed = 1;
         if (!killed && tok_has_high_byte(i)) killed = 1;
+        if (!killed && tok_has_bad_fragment(i)) killed = 1;
+        if (!killed && tok_has_leading_ws_apos(i)) killed = 1;
+        if (!killed && prev_tok >= 0 && tok_ends_ws(prev_tok) && tok_starts_text(i, "'"))
+            killed = 1;
+        if (!killed && prev_tok >= 0 && tok_trimmed_equals(prev_tok, "i") && tok_starts_text(i, "'") &&
+            !tok_starts_text(i, "'m") && !tok_starts_text(i, "'ll") &&
+            !tok_starts_text(i, "'ve") && !tok_starts_text(i, "'d"))
+            killed = 1;
+        if (!killed && prev_tok >= 0 && tok_is_terminal_boundary(i) && tok_is_bad_boundary_prev(prev_tok))
+            killed = 1;
+        if (!killed && history && candidate_forms_bad_fragment(history, hist_n, i))
+            killed = 1;
         if (killed) logits[i] = -1e9f;
         else survivors++;
     }
@@ -1059,6 +1253,254 @@ static int is_boundary(const nt_bpe* bpe, int id) {
     return 0;
 }
 
+static int decode_ids_text(const nt_bpe* bpe, const int* ids, int n, char* out, int cap) {
+    if (cap <= 0) return 0;
+    int olen = 0;
+    char tmp[NT_BPE_MAX_TOKEN_LEN + 1];
+    for (int i = 0; i < n && olen < cap - 1; i++) {
+        int room = cap - 1 - olen;
+        int want = room < NT_BPE_MAX_TOKEN_LEN ? room : NT_BPE_MAX_TOKEN_LEN;
+        int len = nt_bpe_decode(bpe, &ids[i], 1, tmp, want);
+        if (len > 0) {
+            memcpy(out + olen, tmp, len);
+            olen += len;
+        }
+    }
+    out[olen] = 0;
+    return olen;
+}
+
+static void ascii_lower_copy(const char* in, char* out, int cap) {
+    int i = 0;
+    if (cap <= 0) return;
+    for (; in[i] && i < cap - 1; i++) {
+        unsigned char c = (unsigned char)in[i];
+        out[i] = (char)((c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c);
+    }
+    out[i] = 0;
+}
+
+static int contains_ascii(const char* hay, const char* needle) {
+    return hay && needle && strstr(hay, needle) != NULL;
+}
+
+#define MOTIF_N 12
+#define MOTIF_TERMS 8
+
+typedef struct {
+    const char* name;
+    const char* terms[MOTIF_TERMS];
+} MotifSpec;
+
+typedef struct {
+    float act[MOTIF_N];
+} MotifLedger;
+
+static const MotifSpec MOTIFS[MOTIF_N] = {
+    {"door",   {"door", "threshold", "knock", "window", "room", NULL}},
+    {"bone",   {"bone", "body", "tooth", "skeleton", "blood", NULL}},
+    {"soup",   {"soup", "spoon", "broth", "kitchen", "sunday", "grandmother", NULL}},
+    {"signal", {"signal", "sonar", "resonance", "echo", "frequency", "chamber", "noise", NULL}},
+    {"model",  {"model", "token", "weight", "gradient", "loss", "architecture", "compiler", NULL}},
+    {"love",   {"love", "mercy", "mother", "tender", "care", NULL}},
+    {"void",   {"void", "silence", "absence", "nothing", "dark", "empty", NULL}},
+    {"lab",    {"lab", "inventory", "protocol", "observation", "function", "zero", NULL}},
+    {"memory", {"memory", "remember", "forgot", "archive", "name", "names", NULL}},
+    {"machine",{"machine", "metal", "engine", "device", "server", "circuit", NULL}},
+    {"haze",   {"haze", "smoke", "dream", "fever", "sleep", NULL}},
+    {"speech", {"speech", "say", "says", "voice", "mouth", "sentence", "word", NULL}}
+};
+
+static int motif_hits_text(const char* lower, int* hits) {
+    int total = 0;
+    for (int i = 0; i < MOTIF_N; i++) {
+        hits[i] = 0;
+        for (int j = 0; j < MOTIF_TERMS && MOTIFS[i].terms[j]; j++) {
+            if (contains_ascii(lower, MOTIFS[i].terms[j])) {
+                hits[i] = 1;
+                total++;
+                break;
+            }
+        }
+    }
+    return total;
+}
+
+static void motif_init(MotifLedger* ml, GenMode mode, const char* seed_text) {
+    memset(ml, 0, sizeof(*ml));
+    if (mode == MODE_RITUAL) {
+        ml->act[0] = 0.30f;  /* door */
+        ml->act[1] = 0.24f;  /* bone */
+        ml->act[2] = 0.34f;  /* soup */
+        ml->act[5] = 0.28f;  /* love */
+        ml->act[6] = 0.20f;  /* void */
+    } else if (mode == MODE_CLINICAL) {
+        ml->act[3] = 0.25f;  /* signal */
+        ml->act[4] = 0.35f;  /* model */
+        ml->act[7] = 0.35f;  /* lab */
+        ml->act[9] = 0.20f;  /* machine */
+    } else if (mode == MODE_DIALOGUE) {
+        ml->act[0] = 0.20f;  /* door */
+        ml->act[5] = 0.20f;  /* love */
+        ml->act[11] = 0.35f; /* speech */
+    } else if (mode == MODE_COHERENT) {
+        ml->act[3] = 0.18f;  /* signal */
+        ml->act[8] = 0.22f;  /* memory */
+        ml->act[11] = 0.22f; /* speech */
+    }
+
+    if (seed_text && *seed_text) {
+        char lower[4096];
+        ascii_lower_copy(seed_text, lower, (int)sizeof(lower));
+        int hits[MOTIF_N];
+        motif_hits_text(lower, hits);
+        for (int i = 0; i < MOTIF_N; i++) {
+            if (hits[i]) {
+                ml->act[i] += 0.35f;
+                if (ml->act[i] > 1.0f) ml->act[i] = 1.0f;
+            }
+        }
+    }
+}
+
+static float motif_candidate_score(const MotifLedger* ml, const char* lower) {
+    int hits[MOTIF_N];
+    int n_hits = motif_hits_text(lower, hits);
+    float sc = 0.0f;
+    for (int i = 0; i < MOTIF_N; i++) {
+        if (!hits[i]) continue;
+        sc += 0.18f + 0.75f * ml->act[i];
+        if (ml->act[i] < 0.08f) sc += 0.12f;      /* controlled new motif */
+        if (ml->act[i] > 0.85f) sc -= 0.18f;      /* don't chant one word forever */
+    }
+    if (n_hits == 0) sc -= 0.25f;
+    if (n_hits > 3) sc -= 0.08f * (float)(n_hits - 3);
+    if (g_mode == MODE_DIALOGUE && (contains_ascii(lower, "\"") || contains_ascii(lower, " says")))
+        sc += 0.25f;
+    return sc;
+}
+
+static void motif_update(MotifLedger* ml, const char* lower) {
+    int hits[MOTIF_N];
+    motif_hits_text(lower, hits);
+    for (int i = 0; i < MOTIF_N; i++) ml->act[i] *= 0.86f;
+    for (int i = 0; i < MOTIF_N; i++) {
+        if (!hits[i]) continue;
+        ml->act[i] += 0.34f;
+        if (ml->act[i] > 1.0f) ml->act[i] = 1.0f;
+    }
+    /* Soft cross-coupling: motifs re-enter as neighboring obsessions. */
+    if (hits[0]) { ml->act[6] += 0.05f; ml->act[11] += 0.04f; } /* door -> void/speech */
+    if (hits[2]) { ml->act[5] += 0.05f; ml->act[8] += 0.03f; }  /* soup -> love/memory */
+    if (hits[3]) { ml->act[4] += 0.05f; ml->act[9] += 0.03f; }  /* signal -> model/machine */
+    if (hits[4]) { ml->act[3] += 0.04f; ml->act[7] += 0.04f; }  /* model -> signal/lab */
+    for (int i = 0; i < MOTIF_N; i++) if (ml->act[i] > 1.0f) ml->act[i] = 1.0f;
+}
+
+static void motif_print(const MotifLedger* ml) {
+    printf("[motifs]");
+    int printed = 0;
+    int used[MOTIF_N] = {0};
+    for (int pass = 0; pass < 3; pass++) {
+        int best = -1;
+        float bm = 0.05f;
+        for (int i = 0; i < MOTIF_N; i++) {
+            if (!used[i] && ml->act[i] > bm) {
+                best = i;
+                bm = ml->act[i];
+            }
+        }
+        if (best < 0) break;
+        printf(" %s:%.0f%%", MOTIFS[best].name, ml->act[best] * 100.0f);
+        used[best] = 1;
+        printed++;
+    }
+    if (!printed) printf(" quiet");
+    printf("\n");
+}
+
+static int word_tail_is_bad(const char* lower) {
+    int e = (int)strlen(lower);
+    while (e > 0 && isspace((unsigned char)lower[e-1])) e--;
+    if (e > 0 && (lower[e-1] == '.' || lower[e-1] == '!' || lower[e-1] == '?')) e--;
+    while (e > 0 && isspace((unsigned char)lower[e-1])) e--;
+    int s = e;
+    while (s > 0 && ((lower[s-1] >= 'a' && lower[s-1] <= 'z') || lower[s-1] == '\'')) s--;
+    int len = e - s;
+    if (len <= 0 || len > 15) return 0;
+    char w[16];
+    memcpy(w, lower + s, len);
+    w[len] = 0;
+    static const char* bad[] = {
+        "the","and","or","of","to","in","as","is","be","will","who",
+        "for","with","that","which","when","where","from","into","by",
+        "because","if","than","then","was","were","are","a","an", NULL
+    };
+    for (const char** p = bad; *p; p++) if (!strcmp(w, *p)) return 1;
+    return 0;
+}
+
+static float closure_score_text(const char* text, const char* lower) {
+    float sc = 0.0f;
+    int n = (int)strlen(text);
+    int s = 0, e = n;
+    while (s < e && isspace((unsigned char)text[s])) s++;
+    while (e > s && isspace((unsigned char)text[e-1])) e--;
+    if (e <= s) return -1.0f;
+
+    char last = text[e - 1];
+    if (last == '.' || last == '!' || last == '?') sc += 0.45f;
+    else sc -= 0.65f;
+    if (text[s] >= 'A' && text[s] <= 'Z') sc += 0.10f;
+    else sc -= 0.05f;
+
+    int quotes = 0, newlines = 0, high = 0;
+    for (int i = s; i < e; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == '"') quotes++;
+        if (c == '\n' || c == '\r') newlines++;
+        if (c >= 0x80) high++;
+    }
+    sc += (quotes % 2 == 0) ? 0.12f : -0.32f;
+    if (newlines == 0) sc += 0.10f; else sc -= 0.35f;
+    if (high > 0) sc -= 0.45f;
+    if (word_tail_is_bad(lower)) sc -= 0.55f;
+
+    static const char* broken[] = {
+        "catamean", "decigare", "meas", "noion", "aniain", "tchef",
+        "baher", "obser", "iction", "inction", "forgoing", "atten,",
+        "bon'm", "staything", "oniain", "onid", "formean", "ameas",
+        "completen", "beat's", "noid", "possibion", "doorat", " inall",
+        " on's", "differ\"", NULL
+    };
+    for (const char** p = broken; *p; p++)
+        if (contains_ascii(lower, *p)) sc -= 0.18f;
+    if (contains_ascii(lower, " and .") || contains_ascii(lower, " the .") ||
+        contains_ascii(lower, " of .") || contains_ascii(lower, " to ."))
+        sc -= 0.55f;
+    if (contains_ascii(lower, " to says") || contains_ascii(lower, " a and"))
+        sc -= 0.30f;
+    if (contains_ascii(lower, "it'") && !contains_ascii(lower, "it's") &&
+        !contains_ascii(lower, "it'll") && !contains_ascii(lower, "it'd"))
+        sc -= 0.45f;
+    return sc;
+}
+
+static float coherence_no_metaw(const int* ids, int n);
+
+static float score_candidate(const nt_bpe* bpe, const int* ids, int n, int prompt_len,
+                             const MotifLedger* motifs, const ModeCfg* cfg) {
+    int gn = n - prompt_len;
+    if (gn < 0) gn = 0;
+    float base = coherence_no_metaw(ids + prompt_len, gn);
+    char text[4096], lower[4096];
+    decode_ids_text(bpe, ids + prompt_len, gn, text, (int)sizeof(text));
+    ascii_lower_copy(text, lower, (int)sizeof(lower));
+    float close = closure_score_text(text, lower);
+    float motif = motif_candidate_score(motifs, lower);
+    return base + cfg->closure_w * close + cfg->motif_w * motif;
+}
+
 static float coherence_no_metaw(const int* ids, int n) {
     if (n < 2) return -1.0f;
     int seen[VOCAB] = {0}; int unique = 0;
@@ -1076,7 +1518,7 @@ static float coherence_no_metaw(const int* ids, int n) {
  * fresh cache). CTX-bound: if pos hits CTX-1 we stop the sentence.
  */
 static int gen_sentence(Model* m, const nt_bpe* bpe,
-                        const int* prompt, int plen, float temp,
+                        const int* prompt, int plen, float temp, float top_p,
                         int* out, int out_cap, AMLField* field) {
     int ol = 0;
     for (int i = 0; i < plen && i < CTX/2; i++) out[ol++] = prompt[i];
@@ -1106,7 +1548,7 @@ static int gen_sentence(Model* m, const nt_bpe* bpe,
 
         float lbuf[VOCAB]; memcpy(lbuf, logits, VOCAB * sizeof(float));
         float field_adj[VOCAB];
-        int next = sample(lbuf, VOCAB, temp, 0.95f, field, field_adj, out, ol, gen_step);
+        int next = sample(lbuf, VOCAB, temp, top_p, field, field_adj, out, ol, gen_step);
 
         if (field) {
             field->prophecy_debt = field->prophecy_debt * field->debt_decay
@@ -1206,6 +1648,28 @@ static void print_sentence_post(const nt_bpe* bpe, const int* ids, int n) {
     printf("%s", p);
 }
 
+static int parse_uint_arg(const char* s, unsigned* out) {
+    if (!s || !*s) return 0;
+    char* end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (!end || *end != 0) return 0;
+    *out = (unsigned)v;
+    return 1;
+}
+
+static GenMode parse_mode_arg(const char* s) {
+    if (!s || !*s) return MODE_BALANCED;
+    char low[32];
+    ascii_lower_copy(s, low, (int)sizeof(low));
+    for (int i = 0; i < MODE_COUNT; i++)
+        if (!strcmp(low, MODE_CFG[i].name)) return (GenMode)i;
+    if (!strcmp(low, "clean")) return MODE_COHERENT;
+    if (!strcmp(low, "schizo") || !strcmp(low, "shiza")) return MODE_RITUAL;
+    if (!strcmp(low, "lab")) return MODE_CLINICAL;
+    if (!strcmp(low, "talk")) return MODE_DIALOGUE;
+    return MODE_BALANCED;
+}
+
 int main(int argc, char** argv) {
     /* Default: dual_sym — its distribution is less peaked than single,
        so AML destiny/laws transformations don't over-sharpen. Single weights
@@ -1250,7 +1714,18 @@ int main(int argc, char** argv) {
         }
     }
 
-    unsigned seed = argc > 3 ? (unsigned)strtoul(argv[3], NULL, 10) : (unsigned)time(NULL);
+    unsigned seed = (unsigned)time(NULL);
+    const char* mode_arg = "balanced";
+    if (argc > 3) {
+        if (parse_uint_arg(argv[3], &seed)) {
+            if (argc > 4) mode_arg = argv[4];
+        } else {
+            mode_arg = argv[3];
+        }
+    }
+    g_mode = parse_mode_arg(mode_arg);
+    const ModeCfg* cfg = &MODE_CFG[g_mode];
+
     nt_seed(seed);
     srand(seed);
     nt_train_mode(0);
@@ -1258,6 +1733,7 @@ int main(int argc, char** argv) {
 
     /* AML field state — destiny/suffering/laws + chambers */
     AMLField field; aml_init(&field);
+    aml_apply_mode(&field, cfg);
 
     /* Encode seed */
     int cids[4096];
@@ -1269,6 +1745,8 @@ int main(int argc, char** argv) {
     int nb = (int)(CHAIN_STEPS * (0.3f + 0.1f * cd));
     if (nb < 1) nb = 1; if (nb >= CHAIN_STEPS) nb = CHAIN_STEPS - 1;
     printf("calendar drift: %.3f → %d backward + %d forward\n", cd, nb, CHAIN_STEPS - nb);
+    printf("mode: %s top_p=%.2f closure_w=%.2f motif_w=%.2f\n",
+           cfg->name, cfg->top_p, cfg->closure_w, cfg->motif_w);
     printf("AML: destiny=%.2f entropy_floor=%.2f resonance_ceiling=%.2f\n",
            field.destiny_bias, field.entropy_floor, field.resonance_ceiling);
     printf("rng seed: %u\n", seed);
@@ -1276,6 +1754,7 @@ int main(int argc, char** argv) {
 
     /* Destiny EMA */
     float destiny[DIM]; memset(destiny, 0, sizeof(destiny));
+    MotifLedger motifs; motif_init(&motifs, g_mode, seed_text);
 
     /* Store chain for SPA */
     int chain_ids[CHAIN_STEPS][SENT_MAX];
@@ -1320,7 +1799,7 @@ int main(int argc, char** argv) {
         float t_sec = (float)si / (float)CHAIN_STEPS;
         float schumann = 0.4f*sinf(2*M_PI*7.83f*t_sec) + 0.2f*sinf(2*M_PI*14.3f*t_sec)
                       + 0.1f*sinf(2*M_PI*20.8f*t_sec) + 0.05f*sinf(2*M_PI*27.3f*t_sec);
-        float temp = 0.75f + 0.08f * schumann;
+        float temp = 0.75f + 0.08f * schumann + cfg->temp_shift;
         if (temp < 0.45f) temp = 0.45f; if (temp > 0.9f) temp = 0.9f;
 
         /* Best-of-3 */
@@ -1329,16 +1808,21 @@ int main(int argc, char** argv) {
         for (int cand = 0; cand < CAND_N; cand++) {
             int out[SENT_MAX];
             AMLField cand_field = field;
-            int ol = gen_sentence(m, &bpe, prompt, plen, temp, out, SENT_MAX, &cand_field);
-            float sc = coherence_no_metaw(out, ol);
+            int ol = gen_sentence(m, &bpe, prompt, plen, temp, cfg->top_p, out, SENT_MAX, &cand_field);
+            float sc = score_candidate(&bpe, out, ol, plen, &motifs, cfg);
             if (sc > best_sc) {
                 best_sc = sc; best_ol = ol;
                 best_field = cand_field;
                 memcpy(best_out, out, ol * sizeof(int));
             }
-            if (best_sc > 1.2f && best_ol > 30) break;
+            if (best_sc > 2.15f && best_ol > 30) break;
         }
         field = best_field;
+
+        char best_text[4096], best_lower[4096];
+        decode_ids_text(&bpe, best_out + plen, best_ol - plen, best_text, (int)sizeof(best_text));
+        ascii_lower_copy(best_text, best_lower, (int)sizeof(best_lower));
+        motif_update(&motifs, best_lower);
 
         /* Update destiny EMA from last 5 tokens */
         int from = best_ol - 5 > 0 ? best_ol - 5 : 0;
@@ -1372,6 +1856,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 6; i++)
         if (field.ch_act[i] > 0.05f) printf(" %s:%.0f%%", CH_NAME[i], field.ch_act[i]*100);
     printf("\n[debt] final=%.3f\n", field.prophecy_debt);
+    motif_print(&motifs);
 
     /* ── SPA: find weakest sentence, reseed ── */
     float spa_embs[CHAIN_STEPS][SPA_DIM];
@@ -1398,7 +1883,7 @@ int main(int argc, char** argv) {
         int prompt[5];
         for (int i = 0; i < plen; i++) prompt[i] = cids[r + 1 + i];
         int out[SENT_MAX];
-        int ol = gen_sentence(m, &bpe, prompt, plen, 0.65f, out, SENT_MAX, &field);
+        int ol = gen_sentence(m, &bpe, prompt, plen, 0.65f + cfg->temp_shift, cfg->top_p, out, SENT_MAX, &field);
         printf("  [%d] + T=0.65 sc=%.2f ", weak+1, coherence_no_metaw(out, ol));
         print_sentence(&bpe, out, ol);
         printf("\n");

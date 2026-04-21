@@ -55,11 +55,23 @@ make all
 # Generate with the full chain stack
 ./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "The knock came three times"
 ./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "The knock came three times" 123  # deterministic seed
+./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "The knock came three times" 123 coherent
 ```
 
 Required input files:
 - `../dataset_clean.txt` — 231K corpus, 16 voices, used by training and inference metaweights
 - `arianna_bpe_merges.txt` — 1792 merges, vocab 2048
+
+Inference modes:
+- `balanced` — default Sonar pressure
+- `coherent` — lower temperature, tighter top-p, stronger closure scoring
+- `ritual` — more motif recurrence and associative drift
+- `clinical` — lab/model/signal motifs
+- `dialogue` — speech/quote motifs
+
+Changing `arianna_bpe_merges.txt` is not a safe cleanup for existing weights:
+token ids index directly into `wte` and `head`. Current BPE hygiene is
+inference-time filtering/scoring; a true Sonar-BPE v2 requires retraining.
 
 ## Results (single-weights version, 2026-04-18)
 
@@ -108,12 +120,13 @@ ensemble of two Xavier-init matrices, not from learned blend.
 - `infer_janus_sonar_chain.c` — **proper Janus inference**:
   8-step bidirectional chain with calendar-drift compass (forward/backward
   ratio from Hebrew/Gregorian dissonance), Schumann resonance temperature
-  modulation (7.83 Hz + harmonics), best-of-3 candidates per step with
-  coherence scoring, destiny EMA across chain, and SPA (Sentence Phonon
-  Attention) reseed of the weakest sentence at the end. Best-of-3 evaluates
-  candidate AML state on copies and commits only the selected candidate.
-  Sentences cannot terminate before `SENT_MIN_LEN=8` generated tokens, and
-  newline / boundary-with-trailing-text BPE tokens are suppressed.
+  modulation (7.83 Hz + harmonics), best-of-5 candidates per step with
+  closure/aphasia/motif scoring, destiny EMA across chain, and SPA
+  (Sentence Phonon Attention) reseed of the weakest sentence at the end.
+  Best-of evaluates candidate AML state on copies and commits only the
+  selected candidate. Sentences cannot terminate before `SENT_MIN_LEN=8`
+  generated tokens, and newline / boundary-with-trailing-text / toxic
+  fragment BPE joins are suppressed.
 - `Makefile` targets `train_janus_sonar`, `infer_janus_sonar`,
   `infer_janus_sonar_chain`, `train_janus_sft`, `infer_janus_sft`,
   `train_sonar_spa`, `test_sonar_ops`

@@ -7,7 +7,7 @@ SPA contrastive sibling). Corpus: `dataset_clean.txt`, 231 KB across
 16 Sonar voices — hand-written by Oleg and Claude.
 
 Inference stack:
-- 8-step bidirectional chain × 3-candidate best-of
+- 8-step bidirectional chain × 5-candidate best-of
 - calendar drift compass + Schumann temperature modulation
 - SPA sentence-phonon attention + reseed, scored from learned token
   embeddings rather than random projection weights
@@ -18,7 +18,11 @@ Inference stack:
   on ≥ 3 repetitions, age-based repetition penalty 0.335–0.65×
 - **Hard filters** (from neoleo): orphan fragments, capital-glue,
   apostrophe-glue, space-boundary word-gate, digit-glue, non-ASCII,
-  newline tokens, boundary-with-trailing-text BPE tokens
+  newline tokens, boundary-with-trailing-text BPE tokens, toxic
+  fragment families at token and token-join boundaries
+- **Mode/critic layer**: `balanced`, `coherent`, `ritual`, `clinical`,
+  `dialogue`; candidate scoring combines token diversity, closure
+  grammar, aphasia penalties, and a decaying motif ledger
 - **Sentence structure** (from ariannamethod/me): each chain step =
   one complete sentence, Capital-start, boundary-terminated.
   `SENT_MIN_LEN = 8` to allow short sentences; `SENT_MAX_SOFT = 40`

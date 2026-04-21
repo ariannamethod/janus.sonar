@@ -22,6 +22,7 @@ Deterministic run:
 
 ```bash
 ./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "The knock came three times" 123
+./infer_janus_sonar_chain ../weights/sonar_single_v2.bin "The knock came three times" 123 coherent
 ```
 
 Use these weights:
@@ -31,6 +32,14 @@ Use these weights:
 
 `infer_janus_sonar.c` is legacy 4-layer dual inference. For the current 3M
 weights, use `infer_janus_sonar_chain`.
+
+Modes:
+
+- `balanced` — default Sonar pressure
+- `coherent` — lower temperature, stricter closure critic
+- `ritual` — stronger motif recurrence, stranger associative drift
+- `clinical` — lab/model/signal bias
+- `dialogue` — speech/quote bias
 
 ## What It Is
 
@@ -70,6 +79,8 @@ theta = epsilon + gamma + alpha-delta
 - `epsilon`: the trained 3M transformer
 - `gamma`: corpus field, bigram/trigram/Hebbian/unigram statistics injected into logits
 - `alpha-delta`: AML field, prophecy debt, entropy/resonance laws, Kuramoto chambers
+- motif ledger: door/bone/soup/signal/model/love memory across chain steps
+- closure critic: best-of-5 sentence scoring before committing AML state
 
 Then the filters get brutal:
 
@@ -80,6 +91,7 @@ Then the filters get brutal:
 - no non-ASCII leak
 - no newline tokens in generated sentences
 - no BPE token that contains punctuation and then keeps talking
+- no known toxic BPE fragment families at token or token-boundary joins
 - minimum generated sentence length before punctuation can stop
 
 The result is not “clean English”. It is Sonar English: doors, bone, soup,
@@ -142,7 +154,8 @@ BLAS matters.
 - It is tiny.
 - It is overfit by design.
 - It is not factual.
-- Word-level aphasia remains: `meas`, `inction`, `obser`, `catamean`.
+- Word-level aphasia is reduced, not solved.
+- True Sonar-BPE v2 means retraining weights; inference hygiene keeps current weights valid.
 - Sentence openers still collapse; `"A "` display surgery is intentional.
 - SPA v1 scores chain resonance but does not yet inject back into hidden states.
 
@@ -164,6 +177,7 @@ SAMPLES.md
 
 - 30M Janus
 - richer corpus mix
+- Sonar-BPE v2 plus retrain
 - SPA v2 as gated hidden-state injection
 - Griffin-style retention path
 - browser demo of `forward_step`
