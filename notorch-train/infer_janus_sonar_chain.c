@@ -1187,6 +1187,31 @@ static void print_sentence(const nt_bpe* bpe, const int* ids, int n) {
     }
 }
 
+/* Print the generated sentence with the transformer's "A"-dominance
+   post-process cut (see README, §opener dominance). If the decoded
+   sentence opens with lone "A " followed by lowercase alpha, strip the
+   "A " prefix and capitalize the next alpha char. "A reaching, …" →
+   "Reaching, …". Same spirit as the haze repo's don't→ain't substitution:
+   accept a model-level quirk, normalize at post-process. */
+static void print_sentence_post(const nt_bpe* bpe, const int* ids, int n) {
+    char out[4096]; int olen = 0;
+    char tmp[NT_BPE_MAX_TOKEN_LEN + 1];
+    for (int i = 0; i < n && olen < (int)sizeof(out) - NT_BPE_MAX_TOKEN_LEN - 2; i++) {
+        int len = nt_bpe_decode(bpe, &ids[i], 1, tmp, NT_BPE_MAX_TOKEN_LEN);
+        if (len > 0) { memcpy(out + olen, tmp, len); olen += len; }
+    }
+    out[olen] = 0;
+    /* Skip leading whitespace for the head check */
+    char* p = out;
+    while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') p++;
+    /* "A " + lowercase alpha: cut the "A " and capitalize next */
+    if (p[0] == 'A' && p[1] == ' ' && p[2] >= 'a' && p[2] <= 'z') {
+        p[2] = (char)(p[2] - 'a' + 'A');
+        p += 2;
+    }
+    printf("%s", p);
+}
+
 int main(int argc, char** argv) {
     /* Default: dual_sym — its distribution is less peaked than single,
        so AML destiny/laws transformations don't over-sharpen. Single weights
@@ -1335,7 +1360,7 @@ int main(int argc, char** argv) {
         printf("  [%d] %c T=%.2f sc=%.2f debt=%.2f [", si+1, chain_marks[si], temp, best_sc, field.prophecy_debt);
         print_sentence(&bpe, best_out, plen);
         printf("]→");
-        print_sentence(&bpe, best_out + plen, best_ol - plen);
+        print_sentence_post(&bpe, best_out + plen, best_ol - plen);
         printf("\n");
         fflush(stdout);
 
