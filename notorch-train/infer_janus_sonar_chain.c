@@ -15,6 +15,7 @@
 #include "notorch.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
@@ -541,21 +542,119 @@ static void apply_rep_penalty(float* logits, const int* history, int hist_n) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 #define MW_HEBB_WINDOW  8
-#define MW_BIGRAM_W     0.0f    /* tried 0.15 + 0.6; both fragment or crush trained transformer */
-#define MW_HEBB_W       0.0f    /* tried 0.3; truncates sentences early */
-#define MW_WORD_GATE   -3.0f    /* logit penalty for mid-word bigram=0 (standalone filter) */
-#define MW_LOG_FLOOR   -5.0f    /* clip log(p) to prevent log(tiny) crushing */
+/* Q/postgpt-q Dario coefficients — transformer-present regime. Earlier 0.15/0.6
+   was too low for 3M transformer; need stronger field to constrain salad. */
+#define MW_BIGRAM_W     5.0f
+#define MW_TRIGRAM_W    3.0f
+#define MW_HEBB_W       0.4f
+#define MW_UNIGRAM_FLOOR     1e-6f   /* below this → token treated as corpus-absent */
+#define MW_UNI_FLOOR_PEN    -2.0f    /* hard down-weight for corpus-absent candidates */
+#define MW_WORD_GATE   -3.0f         /* soft word-gate (hard filters added later) */
+#define MW_LOG_FLOOR   -5.0f
 
-static float  g_mw_unigram[VOCAB];
-static float (*g_mw_bigram)[VOCAB]  = NULL;   /* 16 MB dense */
-static float (*g_mw_hebbian)[VOCAB] = NULL;   /* 16 MB dense */
-static int    g_mw_ready = 0;
+/* Trigram sparse hash: (a,b,c) → normalized count per (a,b) row.
+   Open-address, linear probe. Capacity sized for ~75K corpus tokens. */
+#define MW_TRI_CAP  (1 << 17)  /* 131072 slots, ~50K expected entries */
+typedef struct { int a, b, c; float prob; } TriEntry;
+
+static float        g_mw_unigram[VOCAB];
+static float      (*g_mw_bigram)[VOCAB]  = NULL;   /* 16 MB dense */
+static float      (*g_mw_hebbian)[VOCAB] = NULL;   /* 16 MB dense */
+static TriEntry    *g_mw_tri = NULL;
+static int          g_mw_tri_n = 0;
+static int          g_mw_ready = 0;
 static const nt_bpe* g_bpe = NULL;
+
+static uint32_t tri_hash(int a, int b, int c) {
+    uint32_t h = (uint32_t)a * 2654435761u;
+    h ^= (uint32_t)b * 2246822519u;
+    h ^= (uint32_t)c * 3266489917u;
+    return h;
+}
+
+static int tri_find_slot(int a, int b, int c) {
+    if (!g_mw_tri) return -1;
+    uint32_t start = tri_hash(a, b, c) & (MW_TRI_CAP - 1);
+    for (uint32_t i = 0; i < MW_TRI_CAP; i++) {
+        uint32_t s = (start + i) & (MW_TRI_CAP - 1);
+        if (g_mw_tri[s].a == -1) return (int)s;  /* empty */
+        if (g_mw_tri[s].a == a && g_mw_tri[s].b == b && g_mw_tri[s].c == c) return (int)s;
+    }
+    return -1;
+}
+
+static float mw_trigram(int a, int b, int c) {
+    int s = tri_find_slot(a, b, c);
+    if (s < 0) return 0.0f;
+    if (g_mw_tri[s].a == -1) return 0.0f;
+    return g_mw_tri[s].prob;
+}
+
+static void tri_bump(int a, int b, int c) {
+    int s = tri_find_slot(a, b, c);
+    if (s < 0) return;
+    if (g_mw_tri[s].a == -1) {
+        g_mw_tri[s].a = a; g_mw_tri[s].b = b; g_mw_tri[s].c = c;
+        g_mw_tri[s].prob = 1.0f;
+        g_mw_tri_n++;
+    } else {
+        g_mw_tri[s].prob += 1.0f;
+    }
+}
+
+/* After bumping raw counts, normalize each (a,b) row: divide by sum_c count(a,b,c).
+   Row sums built in a second pass via small hash over (a,b). */
+#define ROW_CAP (1 << 15)
+typedef struct { int a, b; float sum; } RowEntry;
+
+static uint32_t row_hash(int a, int b) {
+    uint32_t h = (uint32_t)a * 2654435761u;
+    h ^= (uint32_t)b * 2246822519u;
+    return h;
+}
+
+static void tri_normalize(void) {
+    RowEntry* rows = (RowEntry*)calloc(ROW_CAP, sizeof(RowEntry));
+    if (!rows) return;
+    for (uint32_t i = 0; i < ROW_CAP; i++) rows[i].a = -1;
+
+    /* Pass 1: sum per (a,b) */
+    for (uint32_t s = 0; s < MW_TRI_CAP; s++) {
+        if (g_mw_tri[s].a == -1) continue;
+        int a = g_mw_tri[s].a, b = g_mw_tri[s].b;
+        uint32_t start = row_hash(a, b) & (ROW_CAP - 1);
+        for (uint32_t i = 0; i < ROW_CAP; i++) {
+            uint32_t rs = (start + i) & (ROW_CAP - 1);
+            if (rows[rs].a == -1) { rows[rs].a = a; rows[rs].b = b; rows[rs].sum = g_mw_tri[s].prob; break; }
+            if (rows[rs].a == a && rows[rs].b == b) { rows[rs].sum += g_mw_tri[s].prob; break; }
+        }
+    }
+
+    /* Pass 2: divide */
+    for (uint32_t s = 0; s < MW_TRI_CAP; s++) {
+        if (g_mw_tri[s].a == -1) continue;
+        int a = g_mw_tri[s].a, b = g_mw_tri[s].b;
+        uint32_t start = row_hash(a, b) & (ROW_CAP - 1);
+        for (uint32_t i = 0; i < ROW_CAP; i++) {
+            uint32_t rs = (start + i) & (ROW_CAP - 1);
+            if (rows[rs].a == a && rows[rs].b == b) {
+                if (rows[rs].sum > 0) g_mw_tri[s].prob /= rows[rs].sum;
+                break;
+            }
+            if (rows[rs].a == -1) break;
+        }
+    }
+    free(rows);
+}
 
 static void mw_build(const int* ids, int n) {
     if (!g_mw_bigram)  g_mw_bigram  = (float(*)[VOCAB])calloc(VOCAB, sizeof(*g_mw_bigram));
     if (!g_mw_hebbian) g_mw_hebbian = (float(*)[VOCAB])calloc(VOCAB, sizeof(*g_mw_hebbian));
-    if (!g_mw_bigram || !g_mw_hebbian) return;
+    if (!g_mw_tri) {
+        g_mw_tri = (TriEntry*)malloc(MW_TRI_CAP * sizeof(TriEntry));
+        if (g_mw_tri) for (uint32_t i = 0; i < MW_TRI_CAP; i++) g_mw_tri[i].a = -1;
+    }
+    if (!g_mw_bigram || !g_mw_hebbian || !g_mw_tri) return;
     memset(g_mw_unigram, 0, sizeof(g_mw_unigram));
     /* unigram */
     for (int i = 0; i < n; i++)
@@ -593,6 +692,13 @@ static void mw_build(const int* ids, int n) {
         for (int a = 0; a < VOCAB; a++)
             for (int b = 0; b < VOCAB; b++) g_mw_hebbian[a][b] *= inv;
     }
+    /* trigrams: (a,b,c) → count → per-(a,b) row-normalized probability */
+    for (int i = 0; i < n - 2; i++) {
+        int a = ids[i], b = ids[i+1], c = ids[i+2];
+        if (a >= 0 && a < VOCAB && b >= 0 && b < VOCAB && c >= 0 && c < VOCAB)
+            tri_bump(a, b, c);
+    }
+    tri_normalize();
     g_mw_ready = 1;
 }
 
@@ -629,30 +735,28 @@ static int sample(float* logits, int n, float temp, float top_p,
     if (history && hist_n > 0) apply_rep_penalty(logits, history, hist_n);
     if (field) aml_apply_field(logits, n, field);
 
-    /* ── Metaweight blend (PostGPT Dario-style) + word-gate ── */
+    /* ── Dario field (Q/postgpt-q style): θ = ε + γ —
+       transformer (ε) produces logits, metaweights (γ) add bigram/trigram/hebbian
+       pull as raw probabilities with large coefficients. Unigram floor kills
+       corpus-absent tokens. */
     if (g_mw_ready && history && hist_n > 0) {
-        int prev = history[hist_n - 1];
-        if (prev >= 0 && prev < VOCAB) {
-            int prev_alpha = tok_ends_alpha(prev);
-            for (int i = 0; i < n; i++) {
-                float p = g_mw_bigram[prev][i];
-                if (p > 1e-6f) {
-                    /* Seen bigram — soft log-prob pull, clipped */
-                    float lp = logf(p);
-                    if (lp < MW_LOG_FLOOR) lp = MW_LOG_FLOOR;
-                    logits[i] += MW_BIGRAM_W * lp;
-                } else if (prev_alpha && tok_starts_alpha(i)) {
-                    /* Word-gate: unseen bigram between alpha-edge tokens =
-                       likely orphaning a word. Soft downweight, not kill. */
-                    logits[i] += MW_WORD_GATE;
-                }
-                /* Otherwise (unseen bigram, not word-continuing) — no change.
-                   Lets transformer decide on punctuation/boundary tokens. */
-            }
-        }
+        int prev  = history[hist_n - 1];
+        int prev2 = hist_n >= 2 ? history[hist_n - 2] : -1;
+        int prev_alpha = tok_ends_alpha(prev);
         float hebb[VOCAB];
         mw_hebb_query(history, hist_n, hebb, n);
-        for (int i = 0; i < n; i++) logits[i] += MW_HEBB_W * hebb[i];
+        for (int i = 0; i < n; i++) {
+            /* Bigram & trigram: raw probabilities as additive logit boost */
+            float bg = (prev >= 0 && prev < VOCAB) ? g_mw_bigram[prev][i] : 0;
+            float tg = (prev2 >= 0) ? mw_trigram(prev2, prev, i) : 0;
+            logits[i] += MW_BIGRAM_W * bg + MW_TRIGRAM_W * tg + MW_HEBB_W * hebb[i];
+            /* Unigram floor: tokens the corpus never sees get hard-pushed down.
+               Strips out the majority of random-BPE salad. */
+            if (g_mw_unigram[i] < MW_UNIGRAM_FLOOR) logits[i] += MW_UNI_FLOOR_PEN;
+            /* Word-gate (soft): mid-word orphan where no bigram backs it up */
+            if (prev_alpha && tok_starts_alpha(i) && bg < 1e-6f && tg < 1e-6f)
+                logits[i] += MW_WORD_GATE;
+        }
     }
 
     if (field_out) memcpy(field_out, logits, n * sizeof(float));
