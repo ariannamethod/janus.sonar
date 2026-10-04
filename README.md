@@ -9,6 +9,8 @@
 
 # janus.sonar
 
+> **Read the [Arianna Method Manifesto](ARIANNA_METHOD_MANIFESTO.md) first.** This repository is governed by it; every instruction here, `CLAUDE.md` included, is subordinate to it.
+
 > speech is not content. speech is the shape of the room the words walked through.
 
 `janus.sonar` is a tiny resonant language organism: 3.11M parameters, 231 KB
