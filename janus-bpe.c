@@ -366,19 +366,29 @@ static void chuck_update(float*w,float*g,float*cm,float*cv,int n,float lr){
  * FORWARD + BACKWARD
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* x,frm,lg: one copy. Block tensors ×BLOCKS, head tensors (q..ro,jo) ×BLOCKS*HEADS — backward reads them via acts_at */
 typedef struct{float*x,*rm1,*cat,*ao,*r1,*rm2,*mg,*mu,*ms,*mo,*r2;
 float*q,*k,*v,*at,*ho,*ra,*rv,*ro,*je,*ja,*jo,*frm,*lg;}Acts;
 
 static void acts_alloc(Acts*a){
-    a->x=calloc(MAX_T*DIM,4);a->rm1=calloc(MAX_T*DIM,4);a->cat=calloc(MAX_T*DIM,4);
-    a->ao=calloc(MAX_T*DIM,4);a->r1=calloc(MAX_T*DIM,4);a->rm2=calloc(MAX_T*DIM,4);
-    a->mg=calloc(MAX_T*MLP_DIM,4);a->mu=calloc(MAX_T*MLP_DIM,4);a->ms=calloc(MAX_T*MLP_DIM,4);
-    a->mo=calloc(MAX_T*DIM,4);a->r2=calloc(MAX_T*DIM,4);
-    a->q=calloc(MAX_T*HEAD_DIM,4);a->k=calloc(MAX_T*HEAD_DIM,4);a->v=calloc(MAX_T*HEAD_DIM,4);
-    a->at=calloc(MAX_T*MAX_T,4);a->ho=calloc(MAX_T*HEAD_DIM,4);
-    a->ra=calloc(MAX_T*MAX_T,4);a->rv=calloc(MAX_T*HEAD_DIM,4);a->ro=calloc(MAX_T*HEAD_DIM,4);
-    a->je=calloc(MAX_T*DIM,4);a->ja=calloc(MAX_T*MAX_T,4);a->jo=calloc(MAX_T*HEAD_DIM,4);
+    const size_t L=BLOCKS,LH=BLOCKS*HEADS;
+    a->x=calloc(MAX_T*DIM,4);a->rm1=calloc(L*MAX_T*DIM,4);a->cat=calloc(L*MAX_T*DIM,4);
+    a->ao=calloc(L*MAX_T*DIM,4);a->r1=calloc(L*MAX_T*DIM,4);a->rm2=calloc(L*MAX_T*DIM,4);
+    a->mg=calloc(L*MAX_T*MLP_DIM,4);a->mu=calloc(L*MAX_T*MLP_DIM,4);a->ms=calloc(L*MAX_T*MLP_DIM,4);
+    a->mo=calloc(L*MAX_T*DIM,4);a->r2=calloc(L*MAX_T*DIM,4);
+    a->q=calloc(LH*MAX_T*HEAD_DIM,4);a->k=calloc(LH*MAX_T*HEAD_DIM,4);a->v=calloc(LH*MAX_T*HEAD_DIM,4);
+    a->at=calloc(LH*MAX_T*MAX_T,4);a->ho=calloc(LH*MAX_T*HEAD_DIM,4);
+    a->ra=calloc(LH*MAX_T*MAX_T,4);a->rv=calloc(LH*MAX_T*HEAD_DIM,4);a->ro=calloc(LH*MAX_T*HEAD_DIM,4);
+    a->je=calloc(L*MAX_T*DIM,4);a->ja=calloc(L*MAX_T*MAX_T,4);a->jo=calloc(LH*MAX_T*HEAD_DIM,4);
     a->frm=calloc(MAX_T*DIM,4);a->lg=calloc(MAX_T*BPE_VOCAB,4);
+}
+static Acts acts_at(const Acts*a,int b,int h){
+    Acts s=*a;size_t B=(size_t)b*MAX_T,H=((size_t)b*HEADS+h)*MAX_T;
+    s.rm1+=B*DIM;s.cat+=B*DIM;s.ao+=B*DIM;s.r1+=B*DIM;s.rm2+=B*DIM;
+    s.mg+=B*MLP_DIM;s.mu+=B*MLP_DIM;s.ms+=B*MLP_DIM;s.mo+=B*DIM;s.r2+=B*DIM;s.je+=B*DIM;s.ja+=B*MAX_T;
+    s.q+=H*HEAD_DIM;s.k+=H*HEAD_DIM;s.v+=H*HEAD_DIM;s.at+=H*MAX_T;s.ho+=H*HEAD_DIM;
+    s.ra+=H*MAX_T;s.rv+=H*HEAD_DIM;s.ro+=H*HEAD_DIM;s.jo+=H*HEAD_DIM;
+    return s;
 }
 static void acts_free(Acts*a){
     free(a->x);free(a->rm1);free(a->cat);free(a->ao);free(a->r1);free(a->rm2);
@@ -406,40 +416,42 @@ static float forward(Ptrs*w,Acts*a,int*tok,int*tgt,int T){
         a->x[t*DIM+e]=w->tok_emb[tok[t]*DIM+e]+w->pos_emb[t*DIM+e];
     float*cur=a->x;
     for(int b=0;b<BLOCKS;b++){
-        rmsnorm_fwd(a->rm1,cur,w->rms1[b],T,DIM);
-        memset(a->cat,0,T*DIM*4);
+        Acts s=acts_at(a,b,0);
+        rmsnorm_fwd(s.rm1,cur,w->rms1[b],T,DIM);
+        memset(s.cat,0,T*DIM*4);
         for(int h=0;h<HEADS;h++){
-            matmul(a->q,a->rm1,w->wq[b]+h*DIM*HEAD_DIM,T,DIM,HEAD_DIM);
-            matmul(a->k,a->rm1,w->wk[b]+h*DIM*HEAD_DIM,T,DIM,HEAD_DIM);
-            matmul(a->v,a->rm1,w->wv[b]+h*DIM*HEAD_DIM,T,DIM,HEAD_DIM);
+            s=acts_at(a,b,h);
+            matmul(s.q,s.rm1,w->wq[b]+h*DIM*HEAD_DIM,T,DIM,HEAD_DIM);
+            matmul(s.k,s.rm1,w->wk[b]+h*DIM*HEAD_DIM,T,DIM,HEAD_DIM);
+            matmul(s.v,s.rm1,w->wv[b]+h*DIM*HEAD_DIM,T,DIM,HEAD_DIM);
             float sc=1/sqrtf((float)HEAD_DIM);
             for(int i=0;i<T;i++){for(int j=0;j<T;j++){
-                if(j>i){a->at[i*T+j]=-1e9f;continue;}
-                float s=0;for(int d=0;d<HEAD_DIM;d++)s+=a->q[i*HEAD_DIM+d]*a->k[j*HEAD_DIM+d];
-                a->at[i*T+j]=s*sc;}row_softmax(a->at+i*T,T);}
-            matmul(a->ho,a->at,a->v,T,T,HEAD_DIM);
-            matmul(a->rv,a->rm1,w->wvr[b]+h*DIM*HEAD_DIM,T,DIM,HEAD_DIM);
-            matmul(a->ra,a->rm1,w->wr[b]+h*DIM*MAX_T,T,DIM,T);
-            for(int i=0;i<T*T;i++)a->ra[i]*=sc;
-            for(int i=0;i<T;i++){for(int j=i+1;j<T;j++)a->ra[i*T+j]=-1e9f;row_softmax(a->ra+i*T,T);}
-            matmul(a->ro,a->ra,a->rv,T,T,HEAD_DIM);
-            if(h==0) janus_attention(a->rm1,w->wj[b],a->je,a->ja,T);
+                if(j>i){s.at[i*T+j]=-1e9f;continue;}
+                float z=0;for(int d=0;d<HEAD_DIM;d++)z+=s.q[i*HEAD_DIM+d]*s.k[j*HEAD_DIM+d];
+                s.at[i*T+j]=z*sc;}row_softmax(s.at+i*T,T);}
+            matmul(s.ho,s.at,s.v,T,T,HEAD_DIM);
+            matmul(s.rv,s.rm1,w->wvr[b]+h*DIM*HEAD_DIM,T,DIM,HEAD_DIM);
+            matmul(s.ra,s.rm1,w->wr[b]+h*DIM*MAX_T,T,DIM,T);
+            for(int i=0;i<T*T;i++)s.ra[i]*=sc;
+            for(int i=0;i<T;i++){for(int j=i+1;j<T;j++)s.ra[i*T+j]=-1e9f;row_softmax(s.ra+i*T,T);}
+            matmul(s.ro,s.ra,s.rv,T,T,HEAD_DIM);
+            if(h==0) janus_attention(s.rm1,w->wj[b],s.je,s.ja,T);
             for(int t=0;t<T;t++) for(int d=0;d<HEAD_DIM;d++){
-                float s=0;for(int j=0;j<=t;j++)s+=a->ja[t*T+j]*a->je[j*DIM+h*HEAD_DIM+d];
-                a->jo[t*HEAD_DIM+d]=s;}
+                float z=0;for(int j=0;j<=t;j++)z+=s.ja[t*T+j]*s.je[j*DIM+h*HEAD_DIM+d];
+                s.jo[t*HEAD_DIM+d]=z;}
             float gl[3]={w->gate[b][h*3],w->gate[b][h*3+1],w->gate[b][h*3+2]};row_softmax(gl,3);
             for(int t=0;t<T;t++) for(int d=0;d<HEAD_DIM;d++)
-                a->cat[t*DIM+h*HEAD_DIM+d]=gl[0]*a->ho[t*HEAD_DIM+d]+gl[1]*a->ro[t*HEAD_DIM+d]+gl[2]*a->jo[t*HEAD_DIM+d];
+                s.cat[t*DIM+h*HEAD_DIM+d]=gl[0]*s.ho[t*HEAD_DIM+d]+gl[1]*s.ro[t*HEAD_DIM+d]+gl[2]*s.jo[t*HEAD_DIM+d];
         }
-        matmul(a->ao,a->cat,w->wo[b],T,DIM,DIM);
-        for(int i=0;i<T*DIM;i++) a->r1[i]=cur[i]+a->ao[i];
-        rmsnorm_fwd(a->rm2,a->r1,w->rms2[b],T,DIM);
-        matmul(a->mg,a->rm2,w->w_gate[b],T,DIM,MLP_DIM);
-        matmul(a->mu,a->rm2,w->w_up[b],T,DIM,MLP_DIM);
-        for(int i=0;i<T*MLP_DIM;i++) a->ms[i]=siluf(a->mg[i])*a->mu[i];
-        matmul(a->mo,a->ms,w->w_down[b],T,MLP_DIM,DIM);
-        for(int i=0;i<T*DIM;i++) a->r2[i]=a->r1[i]+a->mo[i];
-        cur=a->r2;
+        matmul(s.ao,s.cat,w->wo[b],T,DIM,DIM);
+        for(int i=0;i<T*DIM;i++) s.r1[i]=cur[i]+s.ao[i];
+        rmsnorm_fwd(s.rm2,s.r1,w->rms2[b],T,DIM);
+        matmul(s.mg,s.rm2,w->w_gate[b],T,DIM,MLP_DIM);
+        matmul(s.mu,s.rm2,w->w_up[b],T,DIM,MLP_DIM);
+        for(int i=0;i<T*MLP_DIM;i++) s.ms[i]=siluf(s.mg[i])*s.mu[i];
+        matmul(s.mo,s.ms,w->w_down[b],T,MLP_DIM,DIM);
+        for(int i=0;i<T*DIM;i++) s.r2[i]=s.r1[i]+s.mo[i];
+        cur=s.r2;
     }
     rmsnorm_fwd(a->frm,cur,w->rms_f,T,DIM);
     matmul(a->lg,a->frm,w->out_w,T,DIM,BPE_VOCAB);
@@ -450,46 +462,108 @@ static float forward(Ptrs*w,Acts*a,int*tok,int*tgt,int T){
     return loss/T;
 }
 
+/* exact RMSNorm backward, accumulates: dx += g*inv*dy - x*inv^3/E*<dy*g,x>, dg += dy*x*inv */
+static void rmsnorm_bwd(float*dx,float*dg,const float*dy,const float*x,const float*g,int T,int E){
+    for(int t=0;t<T;t++){const float*xt=x+t*E,*yt=dy+t*E;float ss=0,dot=0;
+    for(int e=0;e<E;e++){ss+=xt[e]*xt[e];dot+=yt[e]*g[e]*xt[e];}
+    float inv=1/sqrtf(ss/E+1e-5f),c=dot*inv*inv*inv/E;
+    for(int e=0;e<E;e++){dx[t*E+e]+=yt[e]*g[e]*inv-xt[e]*c;dg[e]+=yt[e]*xt[e]*inv;}}
+}
+/* causal row-softmax backward in place: d <- p*(d-<p,d>), masked j>i -> 0 */
+static void softmax_bwd(float*d,const float*p,int T){
+    for(int i=0;i<T;i++){float s=0;for(int j=0;j<=i;j++)s+=p[i*T+j]*d[i*T+j];
+    for(int j=0;j<T;j++)d[i*T+j]=j<=i?p[i*T+j]*(d[i*T+j]-s):0;}
+}
+/* y=x@W, x:T×DIM, W:DIM×n (row stride n): gW += x^T dy, dx += dy W^T; tmp: T×DIM scratch */
+static void linear_bwd(float*gW,const float*W,const float*x,const float*dy,float*dx,float*tmp,int T,int n){
+    matmul_atb(gW,x,dy,DIM,T,n);matmul_abt(tmp,dy,W,T,n,DIM);
+    for(int i=0;i<T*DIM;i++)dx[i]+=tmp[i];
+}
+/* janus_attention backward. pr_t=wj@x_t (echo), sv_t=x_t.(wj^T pr_t)=|pr_t|^2, nm_t=|pr_t|+1e-6,
+   sc_t=cd*sv_t/nm_t, attn=causal softmax(sc_i*sc_j/dt). d sv/d pr=2pr, d nm/d pr=pr/|pr|.
+   dattn is consumed; decho (value-path grad on entry) gets the sc-path added, then
+   dwj += decho^T x, dx += decho@wj. */
+static void janus_attention_bwd(const float*x,const float*wj,const float*echo,const float*attn,
+                                float*dattn,float*decho,float*dwj,float*dx,int T){
+    float cd=1+0.5f*calendar_dissonance(calendar_days_since_epoch());
+    float dt=1+AML.prophecy_debt;
+    float*sc=calloc(T,4),*sv=calloc(T,4),*pn=calloc(T,4),*dsc=calloc(T,4),*tmp=calloc((size_t)T*DIM,4);
+    for(int t=0;t<T;t++){const float*xt=x+t*DIM,*pr=echo+t*DIM;
+    float eb[DIM];for(int i=0;i<DIM;i++){float s=0;for(int j=0;j<DIM;j++)s+=wj[j*DIM+i]*pr[j];eb[i]=s;}
+    float n=0;for(int i=0;i<DIM;i++)n+=pr[i]*pr[i];pn[t]=sqrtf(n);
+    float s=0;for(int i=0;i<DIM;i++)s+=xt[i]*eb[i];sv[t]=s;sc[t]=(s/(pn[t]+1e-6f))*cd;}
+    softmax_bwd(dattn,attn,T);
+    for(int i=0;i<T;i++)for(int j=0;j<=i;j++){dsc[i]+=dattn[i*T+j]*sc[j]/dt;dsc[j]+=dattn[i*T+j]*sc[i]/dt;}
+    for(int t=0;t<T;t++){const float*pr=echo+t*DIM;float*dp=decho+t*DIM;float nm=pn[t]+1e-6f;
+    float dsv=dsc[t]*cd/nm,dnm=-dsc[t]*cd*sv[t]/(nm*nm),k=2*dsv+(pn[t]>0?dnm/pn[t]:0);
+    for(int i=0;i<DIM;i++)dp[i]+=k*pr[i];}
+    matmul_atb(dwj,decho,x,DIM,T,DIM);
+    matmul(tmp,decho,wj,T,DIM,DIM);
+    for(int i=0;i<T*DIM;i++)dx[i]+=tmp[i];
+    free(sc);free(sv);free(pn);free(dsc);free(tmp);
+}
+
 static void backward(Ptrs*w,Ptrs*g,Acts*a,int*tok,int*tgt,int T){
     float*dl=calloc(T*BPE_VOCAB,4),*df=calloc(T*DIM,4),*dc=calloc(T*DIM,4);
     for(int t=0;t<T;t++){for(int v=0;v<BPE_VOCAB;v++)dl[t*BPE_VOCAB+v]=a->lg[t*BPE_VOCAB+v];
     dl[t*BPE_VOCAB+tgt[t]]-=1;for(int v=0;v<BPE_VOCAB;v++)dl[t*BPE_VOCAB+v]/=T;}
     matmul_atb(g->out_w,a->frm,dl,DIM,T,BPE_VOCAB);
     matmul_abt(df,dl,w->out_w,T,BPE_VOCAB,DIM);
-    float*cur=(BLOCKS>0)?a->r2:a->x;
-    for(int t=0;t<T;t++){float ss=0;for(int e=0;e<DIM;e++)ss+=cur[t*DIM+e]*cur[t*DIM+e];
-    float inv=1/sqrtf(ss/DIM+1e-5f);for(int e=0;e<DIM;e++)dc[t*DIM+e]=df[t*DIM+e]*w->rms_f[e]*inv;}
+    float*cur=(BLOCKS>0)?acts_at(a,BLOCKS-1,0).r2:a->x;
+    rmsnorm_bwd(dc,g->rms_f,df,cur,w->rms_f,T,DIM);
+    const float sc=1/sqrtf((float)HEAD_DIM);
     for(int b=BLOCKS-1;b>=0;b--){
+        Acts s=acts_at(a,b,0);
         float*dm=calloc(T*DIM,4);memcpy(dm,dc,T*DIM*4);
-        matmul_atb(g->w_down[b],a->ms,dm,MLP_DIM,T,DIM);
+        matmul_atb(g->w_down[b],s.ms,dm,MLP_DIM,T,DIM);
         float*ds=calloc(T*MLP_DIM,4);matmul_abt(ds,dm,w->w_down[b],T,DIM,MLP_DIM);
         float*dg2=calloc(T*MLP_DIM,4),*du=calloc(T*MLP_DIM,4);
-        for(int i=0;i<T*MLP_DIM;i++){du[i]=ds[i]*siluf(a->mg[i]);dg2[i]=ds[i]*a->mu[i]*siluf_grad(a->mg[i]);}
-        matmul_atb(g->w_gate[b],a->rm2,dg2,DIM,T,MLP_DIM);
-        matmul_atb(g->w_up[b],a->rm2,du,DIM,T,MLP_DIM);
+        for(int i=0;i<T*MLP_DIM;i++){du[i]=ds[i]*siluf(s.mg[i]);dg2[i]=ds[i]*s.mu[i]*siluf_grad(s.mg[i]);}
+        matmul_atb(g->w_gate[b],s.rm2,dg2,DIM,T,MLP_DIM);
+        matmul_atb(g->w_up[b],s.rm2,du,DIM,T,MLP_DIM);
         float*dr=calloc(T*DIM,4),*tmp=calloc(T*DIM,4);
         matmul_abt(dr,dg2,w->w_gate[b],T,MLP_DIM,DIM);
         matmul_abt(tmp,du,w->w_up[b],T,MLP_DIM,DIM);
         for(int i=0;i<T*DIM;i++)dr[i]+=tmp[i];
-        for(int t=0;t<T;t++){float ss=0;for(int e=0;e<DIM;e++)ss+=a->r1[t*DIM+e]*a->r1[t*DIM+e];
-        float inv=1/sqrtf(ss/DIM+1e-5f);for(int e=0;e<DIM;e++)dc[t*DIM+e]+=dr[t*DIM+e]*w->rms2[b][e]*inv;}
+        rmsnorm_bwd(dc,g->rms2[b],dr,s.r1,w->rms2[b],T,DIM);
         float*da=calloc(T*DIM,4);memcpy(da,dc,T*DIM*4);
-        matmul_atb(g->wo[b],a->cat,da,DIM,T,DIM);
-        /* BUG 1 FIX: propagate attention gradient through RMSNorm1 back to cur */
+        matmul_atb(g->wo[b],s.cat,da,DIM,T,DIM);
         float*d_cat=calloc(T*DIM,4);
         matmul_abt(d_cat,da,w->wo[b],T,DIM,DIM); /* d_cat = da @ wo^T */
-        /* RMSNorm1 backward: input = cur at start of this block.
-           For b==0 it's a->x. For b>0, cur = r1 - ao (since r1 = cur + ao). */
-        for(int t=0;t<T;t++){
-            /* Reconstruct cur for this block: r1 = cur + ao, so cur = r1 - ao */
-            float inp[DIM]; /* stack buffer for one timestep */
-            if(b==0) { for(int e=0;e<DIM;e++) inp[e]=a->x[t*DIM+e]; }
-            else { for(int e=0;e<DIM;e++) inp[e]=a->r1[t*DIM+e]-a->ao[t*DIM+e]; }
-            float ss=0;for(int e=0;e<DIM;e++) ss+=inp[e]*inp[e];
-            float inv=1/sqrtf(ss/DIM+1e-5f);
-            for(int e=0;e<DIM;e++) dc[t*DIM+e]+=d_cat[t*DIM+e]*w->rms1[b][e]*inv;
+        /* cat_h = gl0*ho + gl1*ro + gl2*jo, gl=softmax(gate_h): back through all three branches into drm = d rm1 */
+        float*drm=calloc(T*DIM,4),*dje=calloc(T*DIM,4),*dja=calloc((size_t)T*T,4),*dP=calloc((size_t)T*T,4);
+        float*dh=calloc(T*HEAD_DIM,4),*dq=calloc(T*HEAD_DIM,4),*dk=calloc(T*HEAD_DIM,4),*dv=calloc(T*HEAD_DIM,4);
+        for(int h=0;h<HEADS;h++){
+            s=acts_at(a,b,h);const float*dch=d_cat+h*HEAD_DIM;size_t o=(size_t)h*DIM*HEAD_DIM,orr=(size_t)h*DIM*MAX_T;
+            float gl[3]={w->gate[b][h*3],w->gate[b][h*3+1],w->gate[b][h*3+2]};row_softmax(gl,3);
+            float dgl[3]={0,0,0};
+            for(int t=0;t<T;t++)for(int d=0;d<HEAD_DIM;d++){float y=dch[t*DIM+d];
+                dgl[0]+=y*s.ho[t*HEAD_DIM+d];dgl[1]+=y*s.ro[t*HEAD_DIM+d];dgl[2]+=y*s.jo[t*HEAD_DIM+d];}
+            float gs=gl[0]*dgl[0]+gl[1]*dgl[1]+gl[2]*dgl[2];
+            for(int k=0;k<3;k++)g->gate[b][h*3+k]+=gl[k]*(dgl[k]-gs);
+            /* QKV: ho=at@v, at=softmax(q k^T*sc) */
+            for(int t=0;t<T;t++)for(int d=0;d<HEAD_DIM;d++)dh[t*HEAD_DIM+d]=gl[0]*dch[t*DIM+d];
+            memset(dv,0,T*HEAD_DIM*4);matmul_atb(dv,s.at,dh,T,T,HEAD_DIM);
+            matmul_abt(dP,dh,s.v,T,HEAD_DIM,T);softmax_bwd(dP,s.at,T);for(int i=0;i<T*T;i++)dP[i]*=sc;
+            matmul(dq,dP,s.k,T,T,HEAD_DIM);
+            memset(dk,0,T*HEAD_DIM*4);matmul_atb(dk,dP,s.q,T,T,HEAD_DIM);
+            linear_bwd(g->wq[b]+o,w->wq[b]+o,s.rm1,dq,drm,tmp,T,HEAD_DIM);
+            linear_bwd(g->wk[b]+o,w->wk[b]+o,s.rm1,dk,drm,tmp,T,HEAD_DIM);
+            linear_bwd(g->wv[b]+o,w->wv[b]+o,s.rm1,dv,drm,tmp,T,HEAD_DIM);
+            /* retention: ro=ra@rv, ra=softmax(rm1@wr_h*sc); forward reads wr_h as DIM×T, row stride T */
+            for(int t=0;t<T;t++)for(int d=0;d<HEAD_DIM;d++)dh[t*HEAD_DIM+d]=gl[1]*dch[t*DIM+d];
+            memset(dv,0,T*HEAD_DIM*4);matmul_atb(dv,s.ra,dh,T,T,HEAD_DIM);
+            matmul_abt(dP,dh,s.rv,T,HEAD_DIM,T);softmax_bwd(dP,s.ra,T);for(int i=0;i<T*T;i++)dP[i]*=sc;
+            linear_bwd(g->wr[b]+orr,w->wr[b]+orr,s.rm1,dP,drm,tmp,T,T);
+            linear_bwd(g->wvr[b]+o,w->wvr[b]+o,s.rm1,dv,drm,tmp,T,HEAD_DIM);
+            /* janus value path: jo[t]=sum_{j<=t} ja[t,j]*je[j, head h slice]; ja shared by heads */
+            for(int t=0;t<T;t++)for(int d=0;d<HEAD_DIM;d++){float y=gl[2]*dch[t*DIM+d];
+                for(int j=0;j<=t;j++){dja[t*T+j]+=y*s.je[j*DIM+h*HEAD_DIM+d];dje[j*DIM+h*HEAD_DIM+d]+=s.ja[t*T+j]*y;}}
         }
-        free(d_cat);
+        s=acts_at(a,b,0);
+        janus_attention_bwd(s.rm1,w->wj[b],s.je,s.ja,dja,dje,g->wj[b],drm,T);
+        rmsnorm_bwd(dc,g->rms1[b],drm,b?acts_at(a,b-1,0).r2:a->x,w->rms1[b],T,DIM);
+        free(d_cat);free(drm);free(dje);free(dja);free(dP);free(dh);free(dq);free(dk);free(dv);
         if(b==0) for(int t=0;t<T;t++) for(int e=0;e<DIM;e++){
             g->tok_emb[tok[t]*DIM+e]+=dc[t*DIM+e]; g->pos_emb[t*DIM+e]+=dc[t*DIM+e];}
         free(dm);free(ds);free(dg2);free(du);free(dr);free(tmp);free(da);
