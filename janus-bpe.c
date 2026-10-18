@@ -253,6 +253,34 @@ static void matmul_abt(float*C,const float*A,const float*B,int m,int k,int n){
     }
 #endif
 }
+/* _ld variants: B (or C for atb) is a slice of a wider matrix with row stride ld */
+static void matmul_ld(float*C,const float*A,const float*B,int m,int k,int n,int ld){
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasNoTrans,m,n,k,1.0f,A,k,B,ld,0.0f,C,n);
+#else
+    for(int i=0;i<m;i++) for(int j=0;j<n;j++){
+        float s=0; for(int p=0;p<k;p++) s+=A[i*k+p]*B[p*ld+j]; C[i*n+j]=s;
+    }
+#endif
+}
+static void matmul_atb_ld(float*C,const float*A,const float*B,int m,int k,int n,int ld){
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor,CblasTrans,CblasNoTrans,m,n,k,1.0f,A,m,B,n,1.0f,C,ld);
+#else
+    for(int i=0;i<m;i++) for(int j=0;j<n;j++){
+        float s=0; for(int p=0;p<k;p++) s+=A[p*m+i]*B[p*n+j]; C[i*ld+j]+=s;
+    }
+#endif
+}
+static void matmul_abt_ld(float*C,const float*A,const float*B,int m,int k,int n,int ld){
+#ifdef USE_BLAS
+    cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasTrans,m,n,k,1.0f,A,k,B,ld,0.0f,C,n);
+#else
+    for(int i=0;i<m;i++) for(int j=0;j<n;j++){
+        float s=0; for(int p=0;p<k;p++) s+=A[i*k+p]*B[j*ld+p]; C[i*n+j]=s;
+    }
+#endif
+}
 static void row_softmax(float*x,int n){
     float mx=x[0]; for(int i=1;i<n;i++) if(x[i]>mx) mx=x[i];
     float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-mx);s+=x[i];}
@@ -368,7 +396,7 @@ static void chuck_update(float*w,float*g,float*cm,float*cv,int n,float lr){
 
 /* x,frm,lg: one copy. Block tensors ×BLOCKS, head tensors (q..ro,jo) ×BLOCKS*HEADS — backward reads them via acts_at */
 typedef struct{float*x,*rm1,*cat,*ao,*r1,*rm2,*mg,*mu,*ms,*mo,*r2;
-float*q,*k,*v,*at,*ho,*ra,*rv,*ro,*je,*ja,*jo,*frm,*lg;}Acts;
+float*q,*k,*v,*at,*ho,*ra,*rv,*ro,*je,*ja,*jo,*frm,*lg;float cd,dt;}Acts;
 
 static void acts_alloc(Acts*a){
     const size_t L=BLOCKS,LH=BLOCKS*HEADS;
@@ -398,9 +426,7 @@ static void acts_free(Acts*a){
     free(a->frm);free(a->lg);
 }
 
-static void janus_attention(const float*x,const float*wj,float*echo,float*attn,int T){
-    float cd=1+0.5f*calendar_dissonance(calendar_days_since_epoch());
-    float dt=1+AML.prophecy_debt;
+static void janus_attention(const float*x,const float*wj,float*echo,float*attn,int T,float cd,float dt){
     float*sc=calloc(T,4);
     for(int t=0;t<T;t++){const float*xt=x+t*DIM;float*pr=echo+t*DIM;
     for(int i=0;i<DIM;i++){float s=0;for(int j=0;j<DIM;j++)s+=wj[i*DIM+j]*xt[j];pr[i]=s;}
@@ -412,6 +438,8 @@ static void janus_attention(const float*x,const float*wj,float*echo,float*attn,i
 }
 
 static float forward(Ptrs*w,Acts*a,int*tok,int*tgt,int T){
+    a->cd=1+0.5f*calendar_dissonance(calendar_days_since_epoch());
+    a->dt=1+AML.prophecy_debt;
     for(int t=0;t<T;t++) for(int e=0;e<DIM;e++)
         a->x[t*DIM+e]=w->tok_emb[tok[t]*DIM+e]+w->pos_emb[t*DIM+e];
     float*cur=a->x;
@@ -431,11 +459,11 @@ static float forward(Ptrs*w,Acts*a,int*tok,int*tgt,int T){
                 s.at[i*T+j]=z*sc;}row_softmax(s.at+i*T,T);}
             matmul(s.ho,s.at,s.v,T,T,HEAD_DIM);
             matmul(s.rv,s.rm1,w->wvr[b]+h*DIM*HEAD_DIM,T,DIM,HEAD_DIM);
-            matmul(s.ra,s.rm1,w->wr[b]+h*DIM*MAX_T,T,DIM,T);
+            matmul_ld(s.ra,s.rm1,w->wr[b]+h*DIM*MAX_T,T,DIM,T,MAX_T);
             for(int i=0;i<T*T;i++)s.ra[i]*=sc;
             for(int i=0;i<T;i++){for(int j=i+1;j<T;j++)s.ra[i*T+j]=-1e9f;row_softmax(s.ra+i*T,T);}
             matmul(s.ro,s.ra,s.rv,T,T,HEAD_DIM);
-            if(h==0) janus_attention(s.rm1,w->wj[b],s.je,s.ja,T);
+            if(h==0) janus_attention(s.rm1,w->wj[b],s.je,s.ja,T,a->cd,a->dt);
             for(int t=0;t<T;t++) for(int d=0;d<HEAD_DIM;d++){
                 float z=0;for(int j=0;j<=t;j++)z+=s.ja[t*T+j]*s.je[j*DIM+h*HEAD_DIM+d];
                 s.jo[t*HEAD_DIM+d]=z;}
@@ -479,14 +507,16 @@ static void linear_bwd(float*gW,const float*W,const float*x,const float*dy,float
     matmul_atb(gW,x,dy,DIM,T,n);matmul_abt(tmp,dy,W,T,n,DIM);
     for(int i=0;i<T*DIM;i++)dx[i]+=tmp[i];
 }
+static void linear_bwd_ld(float*gW,const float*W,const float*x,const float*dy,float*dx,float*tmp,int T,int n,int ld){
+    matmul_atb_ld(gW,x,dy,DIM,T,n,ld);matmul_abt_ld(tmp,dy,W,T,n,DIM,ld);
+    for(int i=0;i<T*DIM;i++)dx[i]+=tmp[i];
+}
 /* janus_attention backward. pr_t=wj@x_t (echo), sv_t=x_t.(wj^T pr_t)=|pr_t|^2, nm_t=|pr_t|+1e-6,
    sc_t=cd*sv_t/nm_t, attn=causal softmax(sc_i*sc_j/dt). d sv/d pr=2pr, d nm/d pr=pr/|pr|.
    dattn is consumed; decho (value-path grad on entry) gets the sc-path added, then
    dwj += decho^T x, dx += decho@wj. */
 static void janus_attention_bwd(const float*x,const float*wj,const float*echo,const float*attn,
-                                float*dattn,float*decho,float*dwj,float*dx,int T){
-    float cd=1+0.5f*calendar_dissonance(calendar_days_since_epoch());
-    float dt=1+AML.prophecy_debt;
+                                float*dattn,float*decho,float*dwj,float*dx,int T,float cd,float dt){
     float*sc=calloc(T,4),*sv=calloc(T,4),*pn=calloc(T,4),*dsc=calloc(T,4),*tmp=calloc((size_t)T*DIM,4);
     for(int t=0;t<T;t++){const float*xt=x+t*DIM,*pr=echo+t*DIM;
     float eb[DIM];for(int i=0;i<DIM;i++){float s=0;for(int j=0;j<DIM;j++)s+=wj[j*DIM+i]*pr[j];eb[i]=s;}
@@ -550,18 +580,18 @@ static void backward(Ptrs*w,Ptrs*g,Acts*a,int*tok,int*tgt,int T){
             linear_bwd(g->wq[b]+o,w->wq[b]+o,s.rm1,dq,drm,tmp,T,HEAD_DIM);
             linear_bwd(g->wk[b]+o,w->wk[b]+o,s.rm1,dk,drm,tmp,T,HEAD_DIM);
             linear_bwd(g->wv[b]+o,w->wv[b]+o,s.rm1,dv,drm,tmp,T,HEAD_DIM);
-            /* retention: ro=ra@rv, ra=softmax(rm1@wr_h*sc); forward reads wr_h as DIM×T, row stride T */
+            /* retention: ro=ra@rv, ra=softmax(rm1@wr_h*sc); wr_h is the DIM×T left slice of DIM×MAX_T, row stride MAX_T */
             for(int t=0;t<T;t++)for(int d=0;d<HEAD_DIM;d++)dh[t*HEAD_DIM+d]=gl[1]*dch[t*DIM+d];
             memset(dv,0,T*HEAD_DIM*4);matmul_atb(dv,s.ra,dh,T,T,HEAD_DIM);
             matmul_abt(dP,dh,s.rv,T,HEAD_DIM,T);softmax_bwd(dP,s.ra,T);for(int i=0;i<T*T;i++)dP[i]*=sc;
-            linear_bwd(g->wr[b]+orr,w->wr[b]+orr,s.rm1,dP,drm,tmp,T,T);
+            linear_bwd_ld(g->wr[b]+orr,w->wr[b]+orr,s.rm1,dP,drm,tmp,T,T,MAX_T);
             linear_bwd(g->wvr[b]+o,w->wvr[b]+o,s.rm1,dv,drm,tmp,T,HEAD_DIM);
             /* janus value path: jo[t]=sum_{j<=t} ja[t,j]*je[j, head h slice]; ja shared by heads */
             for(int t=0;t<T;t++)for(int d=0;d<HEAD_DIM;d++){float y=gl[2]*dch[t*DIM+d];
                 for(int j=0;j<=t;j++){dja[t*T+j]+=y*s.je[j*DIM+h*HEAD_DIM+d];dje[j*DIM+h*HEAD_DIM+d]+=s.ja[t*T+j]*y;}}
         }
         s=acts_at(a,b,0);
-        janus_attention_bwd(s.rm1,w->wj[b],s.je,s.ja,dja,dje,g->wj[b],drm,T);
+        janus_attention_bwd(s.rm1,w->wj[b],s.je,s.ja,dja,dje,g->wj[b],drm,T,a->cd,a->dt);
         rmsnorm_bwd(dc,g->rms1[b],drm,b?acts_at(a,b-1,0).r2:a->x,w->rms1[b],T,DIM);
         free(d_cat);free(drm);free(dje);free(dja);free(dP);free(dh);free(dq);free(dk);free(dv);
         if(b==0) for(int t=0;t<T;t++) for(int e=0;e<DIM;e++){

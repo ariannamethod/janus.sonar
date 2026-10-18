@@ -42,11 +42,14 @@ static double loss_d(Model*m,Acts*a,int*tok,int*tgt,int T){
     return L/T;
 }
 
-/* Double transcription of forward(): same masks, same wr stride T, same f32 constants (sc, cd, dt, 1e-5f, 1e-6f).
+/* Double transcription of forward(): same masks, same wr stride MAX_T, same f32 constants (sc, cd, dt, 1e-5f, 1e-6f).
    f32 central differences sit on a ~1e-7 rounding floor in L (|g|~1e-4..1e-5 drowns); this one does not.
    probe_grad refuses to run if it disagrees with forward() beyond f32 precision. */
 static void rmm_w(double*C,const double*A,const float*B,int m,int k,int n){
     for(int i=0;i<m;i++)for(int j=0;j<n;j++){double s=0;for(int p=0;p<k;p++)s+=A[i*k+p]*B[p*n+j];C[i*n+j]=s;}
+}
+static void rmm_w_ld(double*C,const double*A,const float*B,int m,int k,int n,int ld){
+    for(int i=0;i<m;i++)for(int j=0;j<n;j++){double s=0;for(int p=0;p<k;p++)s+=A[i*k+p]*B[p*ld+j];C[i*n+j]=s;}
 }
 static void rmm(double*C,const double*A,const double*B,int m,int k,int n){
     for(int i=0;i<m;i++)for(int j=0;j<n;j++){double s=0;for(int p=0;p<k;p++)s+=A[i*k+p]*B[p*n+j];C[i*n+j]=s;}
@@ -76,7 +79,7 @@ static double ref_loss(Ptrs*w,const int*tok,const int*tgt,int T){
             rcsm(at,T);rmm(o,at,v,T,T,HEAD_DIM);
             for(int t=0;t<T;t++)for(int d=0;d<HEAD_DIM;d++)cat[t*DIM+h*HEAD_DIM+d]+=gl[0]*o[t*HEAD_DIM+d];
             rmm_w(v,rm,w->wvr[b]+h*DIM*HEAD_DIM,T,DIM,HEAD_DIM);
-            rmm_w(at,rm,w->wr[b]+h*DIM*MAX_T,T,DIM,T);for(int i=0;i<T*T;i++)at[i]*=hs;
+            rmm_w_ld(at,rm,w->wr[b]+h*DIM*MAX_T,T,DIM,T,MAX_T);for(int i=0;i<T*T;i++)at[i]*=hs;
             rcsm(at,T);rmm(o,at,v,T,T,HEAD_DIM);
             for(int t=0;t<T;t++)for(int d=0;d<HEAD_DIM;d++)cat[t*DIM+h*HEAD_DIM+d]+=gl[1]*o[t*HEAD_DIM+d];
             if(h==0){const float*wj=w->wj[b];
@@ -143,7 +146,7 @@ static int probe_grad(int T,float eps,int n){
     for(int i=0;i<n;i++){int b=cls_blk(c)?i%BLOCKS:0,idx;
         if(c==0)idx=tok[rand()%T]*DIM+rand()%DIM;
         else if(c==1)idx=(rand()%T)*DIM+rand()%DIM;
-        else if(c==6)idx=(rand()%HEADS)*DIM*MAX_T+(rand()%DIM)*T+rand()%T;   /* forward reads wr_h[p*T+j] */
+        else if(c==6)idx=(rand()%HEADS)*DIM*MAX_T+(rand()%DIM)*MAX_T+rand()%T;   /* forward reads wr_h[p*MAX_T+j], j<T */
         else if(c==16)idx=(rand()%DIM)*BPE_VOCAB+tgt[rand()%T];
         else idx=rand()%cls_n(c);
         float*w=cls_ptr(&m.w,c,b)+idx;double an=cls_ptr(&m.g,c,b)[idx];float w0=*w;
